@@ -1,0 +1,14 @@
+# SAST Pattern Learning - Python Dependencies
+
+# LLM Integration
+openai>=1.12.0
+
+# Environment variables
+python-dotenv>=1.0.0
+
+# Progress tracking
+tqdm>=4.66.0
+
+# Testing
+pytest>=8.0.0
+pytest-cov>=4.1.0
