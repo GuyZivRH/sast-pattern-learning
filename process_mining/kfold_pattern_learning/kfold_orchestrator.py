@@ -13,10 +13,17 @@ Result: patterns_2 (refined across all fold combinations)
 import sys
 import json
 import logging
+import threading
+import warnings
 from pathlib import Path
 from typing import Dict, List, Optional
 from datetime import datetime
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from tqdm import tqdm
+
+# Suppress Google Cloud SDK credential warnings
+warnings.filterwarnings('ignore', message='Your application has authenticated using end user credentials')
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 
@@ -48,6 +55,25 @@ class KFoldOrchestrator:
     - No pattern merging (refinement keeps patterns clean)
     """
 
+    # Class-level lock for main logger
+    _main_log_lock = threading.Lock()
+
+    # Class-level lock and counter for progress tracking
+    _progress_lock = threading.Lock()
+    _progress_callback = None
+    _progress_bar = None
+
+    # Class-level LLM call tracking (real-time)
+    _llm_lock = threading.Lock()
+    _llm_successes = 0
+    _llm_failures = 0
+    _llm_log_file = None  # Progress log file handle
+    _llm_calls_log_file = None  # LLM calls log file handle
+
+    # Class-level error tracking
+    _errors_lock = threading.Lock()
+    _llm_errors = []  # List of (issue_type, step_idx, operation, error_msg) tuples
+
     def __init__(
         self,
         train_dir: Path,
@@ -71,7 +97,7 @@ class KFoldOrchestrator:
             n_folds: Number of folds (default: 3)
             platform: LLM platform ("local", "nim", or "vertex")
             random_seed: Random seed for reproducibility
-            workers: Number of parallel workers for evaluation
+            workers: Number of parallel workers (applies to both issue-type-level and evaluation-level parallelization)
             issue_types: List of issue types to process (None = auto-detect)
             validate_all_types_per_fold: Ensure all issue types in each fold
             top_n_only: Filter to top N issue types only (default: True)
@@ -94,6 +120,29 @@ class KFoldOrchestrator:
         self.phase1_dir = self.output_dir / "phase1_kfold_results"
         self.phase1_dir.mkdir(parents=True, exist_ok=True)
 
+        # Create run-specific log directory under logs/
+        from datetime import datetime as dt
+        run_timestamp = dt.now().strftime("%Y%m%d_%H%M%S")
+        self.run_log_dir = Path("logs") / f"run_logs_{run_timestamp}"
+        self.run_log_dir.mkdir(parents=True, exist_ok=True)
+
+        # Initialize progress log file (simple, human-readable progress tracking)
+        progress_log_path = self.run_log_dir / "progress.log"
+        KFoldOrchestrator._llm_log_file = open(progress_log_path, 'w', buffering=1)  # Line buffered
+        KFoldOrchestrator._llm_log_file.write(f"Progress Log - Started at {run_timestamp}\n")
+        KFoldOrchestrator._llm_log_file.write("=" * 80 + "\n\n")
+
+        # Initialize LLM calls log file (detailed LLM call tracking)
+        llm_calls_log_path = self.run_log_dir / "llm_calls.log"
+        KFoldOrchestrator._llm_calls_log_file = open(llm_calls_log_path, 'w', buffering=1)  # Line buffered
+        KFoldOrchestrator._llm_calls_log_file.write(f"LLM Calls Log - Started at {run_timestamp}\n")
+        KFoldOrchestrator._llm_calls_log_file.write("=" * 80 + "\n\n")
+
+        logger.info(f"  Progress log: {progress_log_path}")
+        logger.info(f"  LLM calls log: {llm_calls_log_path}")
+        logger.info(f"  Watch progress: tail -f {progress_log_path}")
+        logger.info(f"  Watch LLM calls: tail -f {llm_calls_log_path}")
+
         # Initialize components
         self.splitter = StratifiedKFoldSplitter(
             n_splits=n_folds,
@@ -106,8 +155,10 @@ class KFoldOrchestrator:
         logger.info(f"Initialized KFoldOrchestrator (Iterative Refinement):")
         logger.info(f"  Train dir: {self.train_dir}")
         logger.info(f"  Output dir: {self.output_dir}")
+        logger.info(f"  Log dir: {self.run_log_dir}")
         logger.info(f"  K-folds: {self.n_folds}")
         logger.info(f"  Platform: {self.platform}")
+        logger.info(f"  Workers: {self.workers} (issue-type + evaluation parallelization)")
         logger.info(f"  Strategy: Step 0 (learn) → Steps 1-{n_folds-1} (refine)")
         if validate_all_types_per_fold:
             logger.info(f"  Validation: Ensure all issue types in each fold")
@@ -150,9 +201,16 @@ class KFoldOrchestrator:
 
         start_time = datetime.now()
 
+        # Log phase start
+        self._log_progress("="*80)
+        self._log_progress("PHASE 1 STARTED: K-Fold Cross-Validation with Iterative Refinement")
+        self._log_progress("="*80)
+
         # Step 1: Create k-fold splits
         logger.info("\n[Step 1/4] Creating stratified k-fold splits...")
+        self._log_progress("▶ PHASE: Parsing files and creating k-fold splits")
         folds = self.splitter.split(self.train_dir)
+        self._log_progress(f"✓ PHASE: Created {len(folds)} folds")
 
         logger.info(f"  Created {len(folds)} folds")
         logger.info(f"  Strategy: Step 0 (learn) → Steps 1-{self.n_folds-1} (iterative refinement)")
@@ -171,26 +229,73 @@ class KFoldOrchestrator:
                 self.issue_types = all_issue_types
 
         logger.info(f"\n[Step 2/4] Processing {len(self.issue_types)} issue types...")
+        logger.info(f"  Using {self.workers} parallel workers for issue-type-level parallelization")
 
         # Step 3: Process each issue type with iterative refinement
         results_by_issue_type = {}
 
+        # Validate fold coverage first (quick check)
+        valid_issue_types = []
         for issue_type in self.issue_types:
-            logger.info(f"\n{'='*80}")
-            logger.info(f"Processing Issue Type: {issue_type}")
-            logger.info(f"{'='*80}")
-
-            # Validate fold coverage if requested
             if self.validate_all_types_per_fold:
                 coverage_ok = self._validate_fold_coverage(folds, issue_type)
                 if not coverage_ok:
-                    logger.error(f"Issue type {issue_type} not in all folds. Consider reducing k or using stratified split.")
-                    logger.error(f"Skipping pattern learning for {issue_type}")
+                    logger.error(f"Issue type {issue_type} not in all folds. Skipping.")
                     continue
+            valid_issue_types.append(issue_type)
 
-            # Run iterative refinement across folds
-            issue_results = self._run_iterative_refinement(folds, issue_type)
-            results_by_issue_type[issue_type] = issue_results
+        # Process issue types in parallel
+        if self.workers > 1:
+            logger.info(f"🔄 Processing {len(valid_issue_types)} issue types with {self.workers} parallel workers...")
+
+            # Calculate total packages to process across all steps
+            # Estimate: count files in first fold and multiply by issue types × steps
+            sample_fold = folds[0]
+            total_files_per_fold = len(sample_fold[0]) + len(sample_fold[1])
+
+            # Total progress units: issue_types × steps × (train_files + val_files)
+            # For simplicity, use steps as major unit and files as minor
+            total_steps = len(valid_issue_types) * self.n_folds
+
+            with ThreadPoolExecutor(max_workers=self.workers) as executor:
+                # Create shared progress bar
+                with tqdm(total=total_steps, desc="Processing steps", unit="step") as pbar:
+                    # Set the progress bar as class variable so workers can update it
+                    KFoldOrchestrator._progress_bar = pbar
+
+                    # Submit all issue types
+                    futures = {
+                        executor.submit(self._process_issue_type_wrapper, folds, issue_type): issue_type
+                        for issue_type in valid_issue_types
+                    }
+
+                    # Collect results as they complete
+                    for future in as_completed(futures):
+                        issue_type = futures[future]
+                        try:
+                            issue_results = future.result()
+                            results_by_issue_type[issue_type] = issue_results
+
+                            # Show final F1 score when issue type completes
+                            final_f1 = issue_results.get('final_metrics', {}).get('f1_score', 0.0)
+                            pbar.set_postfix_str(f"✅ {issue_type} complete (F1: {final_f1:.3f})")
+                        except Exception as e:
+                            logger.error(f"✗ Failed {issue_type}: {e}")
+                            results_by_issue_type[issue_type] = {'error': str(e)}
+                            pbar.set_postfix_str(f"❌ {issue_type} failed")
+
+                    # Clear progress bar reference
+                    KFoldOrchestrator._progress_bar = None
+        else:
+            logger.info(f"🔄 Processing {len(valid_issue_types)} issue types sequentially...")
+
+            for issue_type in tqdm(valid_issue_types, desc="Processing issue types"):
+                try:
+                    issue_results = self._process_issue_type_wrapper(folds, issue_type)
+                    results_by_issue_type[issue_type] = issue_results
+                except Exception as e:
+                    logger.error(f"✗ Failed {issue_type}: {e}")
+                    results_by_issue_type[issue_type] = {'error': str(e)}
 
         # Generate overall summary
         end_time = datetime.now()
@@ -230,9 +335,50 @@ class KFoldOrchestrator:
         logger.info(f"Duration: {duration:.1f}s")
         logger.info(f"Results saved to: {self.phase1_dir}")
 
+        # Report any LLM errors that occurred
+        self._report_llm_errors()
+
         return phase1_results
 
-    def _run_iterative_refinement(self, folds: List, issue_type: str) -> Dict:
+    def _process_issue_type_wrapper(self, folds: List, issue_type: str) -> Dict:
+        """
+        Wrapper for parallel processing of issue types.
+
+        All detailed logging is suppressed - only results are returned.
+        Progress is shown via tqdm progress bar.
+        """
+        # Get root logger and save its current handlers
+        root_logger = logging.getLogger()
+        original_handlers = root_logger.handlers[:]
+
+        # Remove all handlers from root logger to suppress detailed logging
+        for handler in original_handlers:
+            root_logger.removeHandler(handler)
+
+        # Create a null handler to discard all detailed logs
+        null_handler = logging.NullHandler()
+        root_logger.addHandler(null_handler)
+
+        try:
+            result = self._run_iterative_refinement(folds, issue_type, logger)
+            return result
+        except Exception as e:
+            # Log error to main log (restore handlers temporarily)
+            root_logger.removeHandler(null_handler)
+            for handler in original_handlers:
+                root_logger.addHandler(handler)
+
+            logger.error(f"Error processing {issue_type}: {e}", exc_info=True)
+            raise
+        finally:
+            # Remove null handler
+            root_logger.removeHandler(null_handler)
+
+            # Restore original handlers to root logger
+            for handler in original_handlers:
+                root_logger.addHandler(handler)
+
+    def _run_iterative_refinement(self, folds: List, issue_type: str, issue_logger: logging.Logger) -> Dict:
         """
         Run iterative refinement for one issue type.
 
@@ -250,8 +396,8 @@ class KFoldOrchestrator:
         refinement_steps = self._get_refinement_steps(self.n_folds)
 
         for step_idx, (train_fold_indices, val_fold_idx) in enumerate(refinement_steps):
-            logger.info(f"\n  --- Step {step_idx}/{len(refinement_steps)-1} ---")
-            logger.info(f"  Train folds: {train_fold_indices}, Val fold: {val_fold_idx}")
+            issue_logger.info(f"\n  --- Step {step_idx}/{len(refinement_steps)-1} ---")
+            issue_logger.info(f"  Train folds: {train_fold_indices}, Val fold: {val_fold_idx}")
 
             # Get train and val files
             train_files = []
@@ -263,11 +409,15 @@ class KFoldOrchestrator:
 
             if step_idx == 0:
                 # Step 0: Learn patterns from scratch
-                logger.info(f"  Learning initial patterns from {len(train_files)} training files...")
+                issue_logger.info(f"  Learning initial patterns from {len(train_files)} training files...")
+                self._log_progress(f"▶ {issue_type} | Step {step_idx}/{len(refinement_steps)-1} | LEARNING patterns from {len(train_files)} files")
+
                 current_patterns = self.pattern_learner.learn_patterns(
                     train_files=train_files,
                     issue_type=issue_type
                 )
+
+                self._log_progress(f"✓ {issue_type} | Step {step_idx}/{len(refinement_steps)-1} | Pattern learning complete")
 
                 # Save initial patterns
                 pattern_file = self.phase1_dir / f"{issue_type}_step_0_patterns.json"
@@ -276,7 +426,8 @@ class KFoldOrchestrator:
 
             else:
                 # Steps 1-2: Refine existing patterns
-                logger.info(f"  Refining patterns using {len(train_files)} training files...")
+                issue_logger.info(f"  Refining patterns using {len(train_files)} training files...")
+                self._log_progress(f"▶ {issue_type} | Step {step_idx}/{len(refinement_steps)-1} | EVALUATING on {len(train_files)} training files")
 
                 # Evaluate on train files to find misclassifications
                 train_eval = self.fold_evaluator.evaluate_fold(
@@ -289,7 +440,8 @@ class KFoldOrchestrator:
                 misclassified = self._extract_misclassified(train_eval, max_entries=self.max_misclassified_per_step)
 
                 if misclassified:
-                    logger.info(f"  Found {len(misclassified)} misclassifications, refining patterns...")
+                    issue_logger.info(f"  Found {len(misclassified)} misclassifications, refining patterns...")
+                    self._log_progress(f"▶ {issue_type} | Step {step_idx}/{len(refinement_steps)-1} | REFINING patterns ({len(misclassified)} misclassifications)")
 
                     # Refine patterns
                     refinements = self.pattern_refiner.refine_patterns(
@@ -301,12 +453,15 @@ class KFoldOrchestrator:
                     # Apply refinements
                     current_patterns = self._apply_refinements(current_patterns, refinements)
 
+                    self._log_progress(f"✓ {issue_type} | Step {step_idx}/{len(refinement_steps)-1} | Pattern refinement complete")
+
                     # Save refinement details
                     refinement_file = self.phase1_dir / f"{issue_type}_step_{step_idx}_refinements.json"
                     with open(refinement_file, 'w') as f:
                         json.dump(refinements, f, indent=2)
                 else:
-                    logger.info(f"  No misclassifications found, patterns unchanged")
+                    issue_logger.info(f"  No misclassifications found, patterns unchanged")
+                    self._log_progress(f"✓ {issue_type} | Step {step_idx}/{len(refinement_steps)-1} | No refinements needed")
 
                 # Save refined patterns
                 pattern_file = self.phase1_dir / f"{issue_type}_step_{step_idx}_patterns.json"
@@ -314,7 +469,9 @@ class KFoldOrchestrator:
                     json.dump(current_patterns, f, indent=2)
 
             # Evaluate on validation fold
-            logger.info(f"  Evaluating on {len(val_files)} validation files...")
+            issue_logger.info(f"  Evaluating on {len(val_files)} validation files...")
+            self._log_progress(f"▶ {issue_type} | Step {step_idx}/{len(refinement_steps)-1} | VALIDATING on {len(val_files)} files")
+
             val_eval = self.fold_evaluator.evaluate_fold(
                 patterns_dict=current_patterns,
                 val_files=val_files,
@@ -322,10 +479,13 @@ class KFoldOrchestrator:
             )
 
             metrics = val_eval.get('metrics', {})
-            logger.info(f"  Validation Metrics:")
-            logger.info(f"    F1: {metrics.get('f1_score', 0.0):.3f}")
-            logger.info(f"    Precision: {metrics.get('precision', 0.0):.3f}")
-            logger.info(f"    Recall: {metrics.get('recall', 0.0):.3f}")
+            f1_score = metrics.get('f1_score', 0.0)
+            issue_logger.info(f"  Validation Metrics:")
+            issue_logger.info(f"    F1: {f1_score:.3f}")
+            issue_logger.info(f"    Precision: {metrics.get('precision', 0.0):.3f}")
+            issue_logger.info(f"    Recall: {metrics.get('recall', 0.0):.3f}")
+
+            self._log_progress(f"✓ {issue_type} | Step {step_idx}/{len(refinement_steps)-1} | Validation complete (F1: {f1_score:.3f})")
 
             # Save step evaluation
             eval_file = self.phase1_dir / f"{issue_type}_step_{step_idx}_evaluation.json"
@@ -341,7 +501,11 @@ class KFoldOrchestrator:
                 'misclassified_count': len(misclassified) if step_idx > 0 else None
             })
 
+            # Report progress to main thread
+            self._report_step_progress(issue_type, step_idx, len(refinement_steps), f1_score)
+
         # Return results with final patterns
+        self._log_progress(f"✅ {issue_type} | ALL STEPS COMPLETE")
         return {
             'step_results': step_results,
             'final_patterns': current_patterns,
@@ -496,29 +660,45 @@ class KFoldOrchestrator:
         results_by_issue_type = {}
 
         for issue_type, final_patterns in final_patterns_by_issue_type.items():
+            # Setup per-issue-type logger (append mode)
+            issue_logger = self._setup_issue_logger(issue_type, phase_name="PHASE 1.5")
+
             logger.info(f"\nEvaluating final patterns for {issue_type}...")
+            issue_logger.info("\n" + "="*80)
+            issue_logger.info("PHASE 1.5: VALIDATION SET EVALUATION")
+            issue_logger.info("="*80)
 
-            # Evaluate on validation set with sampling
-            eval_result = self.fold_evaluator.evaluate_fold(
-                patterns_dict=final_patterns,
-                val_files=val_files,
-                issue_type=issue_type,
-                max_entries=max_eval_samples
-            )
+            # Temporarily replace global logger
+            original_logger = globals()['logger']
+            globals()['logger'] = issue_logger
 
-            metrics = eval_result.get('metrics', {}).get('overall', {})
-            logger.info(f"  Final Pattern Metrics:")
-            logger.info(f"    F1: {metrics.get('f1', 0.0):.3f}")
-            logger.info(f"    Precision: {metrics.get('precision', 0.0):.3f}")
-            logger.info(f"    Recall: {metrics.get('recall', 0.0):.3f}")
+            try:
+                # Evaluate on validation set with sampling
+                eval_result = self.fold_evaluator.evaluate_fold(
+                    patterns_dict=final_patterns,
+                    val_files=val_files,
+                    issue_type=issue_type,
+                    max_entries=max_eval_samples
+                )
 
-            # Save results
-            results_by_issue_type[issue_type] = eval_result
+                metrics = eval_result.get('metrics', {}).get('overall', {})
+                issue_logger.info(f"Final Pattern Metrics:")
+                issue_logger.info(f"  F1: {metrics.get('f1', 0.0):.3f}")
+                issue_logger.info(f"  Precision: {metrics.get('precision', 0.0):.3f}")
+                issue_logger.info(f"  Recall: {metrics.get('recall', 0.0):.3f}")
 
-            # Save per-issue-type evaluation
-            eval_file = self.phase1_dir / f"{issue_type}_final_evaluation.json"
-            with open(eval_file, 'w') as f:
-                json.dump(eval_result, f, indent=2)
+                # Save results
+                results_by_issue_type[issue_type] = eval_result
+
+                # Save per-issue-type evaluation
+                eval_file = self.phase1_dir / f"{issue_type}_final_evaluation.json"
+                with open(eval_file, 'w') as f:
+                    json.dump(eval_result, f, indent=2)
+
+            finally:
+                # Restore original logger
+                globals()['logger'] = original_logger
+                self._cleanup_issue_logger(issue_logger)
 
         # Save complete Phase 1.5 results
         phase1_5_results = {
@@ -538,6 +718,236 @@ class KFoldOrchestrator:
         logger.info(f"\nPhase 1.5 complete. Results saved to: {phase1_5_file}")
 
         return phase1_5_results
+
+    def _setup_issue_logger(self, issue_type: str, phase_name: str = "") -> logging.Logger:
+        """
+        Setup or get per-issue-type logger (append mode for continuation).
+
+        Args:
+            issue_type: Issue type name
+            phase_name: Optional phase name for logging header
+
+        Returns:
+            Configured logger instance
+        """
+        log_file = self.run_log_dir / f"{issue_type}.log"
+
+        # Create issue-specific logger
+        issue_logger = logging.getLogger(f"kfold.{issue_type}.{phase_name}")
+        issue_logger.setLevel(logging.INFO)
+        issue_logger.propagate = False
+
+        # Add file handler in append mode
+        file_handler = logging.FileHandler(log_file, mode='a')
+        file_handler.setLevel(logging.INFO)
+        file_handler.setFormatter(logging.Formatter(
+            "%(asctime)s - %(levelname)s - %(message)s"
+        ))
+        issue_logger.addHandler(file_handler)
+
+        return issue_logger
+
+    def _cleanup_issue_logger(self, issue_logger: logging.Logger) -> None:
+        """
+        Clean up issue-specific logger handlers.
+
+        Args:
+            issue_logger: Logger to clean up
+        """
+        for handler in issue_logger.handlers[:]:
+            handler.close()
+            issue_logger.removeHandler(handler)
+
+    @classmethod
+    def _report_step_progress(cls, issue_type: str, step_idx: int, total_steps: int, f1_score: float) -> None:
+        """
+        Report step progress to main thread (thread-safe).
+
+        Updates the shared progress bar and writes detailed progress to stderr.
+
+        Args:
+            issue_type: Issue type being processed
+            step_idx: Current step index (0-based)
+            total_steps: Total number of steps
+            f1_score: F1 score for this step
+        """
+        import sys
+        with cls._progress_lock:
+            # Get current LLM stats
+            successes, failures = cls._get_llm_stats()
+            total_llm = successes + failures
+
+            # Update progress bar if available
+            if hasattr(cls, '_progress_bar') and cls._progress_bar is not None:
+                if total_llm > 0:
+                    cls._progress_bar.set_postfix_str(f"{issue_type} Step {step_idx}/{total_steps-1} (F1: {f1_score:.3f}, LLM: {successes}/{total_llm})")
+                else:
+                    cls._progress_bar.set_postfix_str(f"{issue_type} Step {step_idx}/{total_steps-1} (F1: {f1_score:.3f})")
+                cls._progress_bar.update(1)
+
+            # Also write detailed message to stderr
+            if total_llm > 0:
+                progress_msg = f"  → {issue_type}: Step {step_idx}/{total_steps-1} complete (F1: {f1_score:.3f}, LLM: {successes}/{total_llm} ✅)\n"
+            else:
+                progress_msg = f"  → {issue_type}: Step {step_idx}/{total_steps-1} complete (F1: {f1_score:.3f})\n"
+            sys.stderr.write(progress_msg)
+            sys.stderr.flush()
+
+    @classmethod
+    def _report_activity(cls, issue_type: str, step_idx: int, activity: str) -> None:
+        """
+        Report detailed activity progress (thread-safe).
+
+        Args:
+            issue_type: Issue type being processed
+            step_idx: Current step index
+            activity: Activity description
+        """
+        import sys
+        with cls._progress_lock:
+            activity_msg = f"    ⚙️  {issue_type} [Step {step_idx}]: {activity}\n"
+            sys.stderr.write(activity_msg)
+            sys.stderr.flush()
+
+    @classmethod
+    def _log_progress(cls, message: str) -> None:
+        """Write a progress message to the progress log (thread-safe)."""
+        with cls._llm_lock:
+            if cls._llm_log_file:
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                cls._llm_log_file.write(f"[{timestamp}] {message}\n")
+
+    @classmethod
+    def _record_llm_success(cls, issue_type: str = "unknown", operation: str = "classify", context: str = "") -> None:
+        """Record a successful LLM API call (thread-safe)."""
+        with cls._llm_lock:
+            cls._llm_successes += 1
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            # Write to progress log (simple format)
+            if cls._llm_log_file:
+                cls._llm_log_file.write(f"[{timestamp}] ✅ SUCCESS | {issue_type} | {operation} | Total: {cls._llm_successes}/{cls._llm_successes + cls._llm_failures}\n")
+
+            # Write to detailed LLM calls log
+            if cls._llm_calls_log_file:
+                context_str = f" | Context: {context}" if context else ""
+                cls._llm_calls_log_file.write(f"[{timestamp}] ✅ SUCCESS\n")
+                cls._llm_calls_log_file.write(f"  Issue Type: {issue_type}\n")
+                cls._llm_calls_log_file.write(f"  Operation: {operation}{context_str}\n")
+                cls._llm_calls_log_file.write(f"  Running Total: {cls._llm_successes} success / {cls._llm_failures} failures\n")
+                cls._llm_calls_log_file.write("-" * 80 + "\n\n")
+
+    @classmethod
+    def _record_llm_failure(cls, issue_type: str = "unknown", operation: str = "classify", error: str = "", context: str = "") -> None:
+        """Record a failed LLM API call (thread-safe)."""
+        with cls._llm_lock:
+            cls._llm_failures += 1
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            # Write to progress log (simple format)
+            if cls._llm_log_file:
+                error_msg = f" | Error: {error[:100]}" if error else ""
+                cls._llm_log_file.write(f"[{timestamp}] ❌ FAILURE | {issue_type} | {operation}{error_msg} | Total: {cls._llm_successes}/{cls._llm_successes + cls._llm_failures}\n")
+
+            # Write to detailed LLM calls log
+            if cls._llm_calls_log_file:
+                context_str = f" | Context: {context}" if context else ""
+                cls._llm_calls_log_file.write(f"[{timestamp}] ❌ FAILURE\n")
+                cls._llm_calls_log_file.write(f"  Issue Type: {issue_type}\n")
+                cls._llm_calls_log_file.write(f"  Operation: {operation}{context_str}\n")
+                if error:
+                    cls._llm_calls_log_file.write(f"  Error: {error}\n")
+                cls._llm_calls_log_file.write(f"  Running Total: {cls._llm_successes} success / {cls._llm_failures} failures\n")
+                cls._llm_calls_log_file.write("-" * 80 + "\n\n")
+
+    @classmethod
+    def _get_llm_stats(cls) -> tuple:
+        """Get current LLM statistics (thread-safe)."""
+        with cls._llm_lock:
+            return (cls._llm_successes, cls._llm_failures)
+
+    def _report_llm_errors(self) -> None:
+        """
+        Report LLM call statistics from logs.
+
+        Scans logs for successful and failed LLM calls.
+        """
+        import re
+
+        error_patterns = [
+            r'(?i)error.*vertex.*api',
+            r'(?i)error.*anthropic',
+            r'(?i)rate.*limit',
+            r'(?i)quota.*exceeded',
+            r'(?i)429',
+            r'(?i)failed to.*pattern',
+            r'(?i)json.*decode.*error'
+        ]
+
+        success_patterns = [
+            r'Successfully generated patterns',
+            r'Successfully refined patterns',
+            r'Pattern learning complete',
+            r'Refinement complete',
+            r'Classified \d+ entries'
+        ]
+
+        main_log = self.run_log_dir / "main.log"
+        llm_errors = []
+        llm_successes = 0
+
+        # Check main log
+        if main_log.exists():
+            with open(main_log, 'r') as f:
+                for line_num, line in enumerate(f, 1):
+                    # Check for errors
+                    for pattern in error_patterns:
+                        if re.search(pattern, line):
+                            llm_errors.append(('main.log', line_num, line.strip()))
+                            break
+                    # Check for successes
+                    for pattern in success_patterns:
+                        if re.search(pattern, line):
+                            llm_successes += 1
+                            break
+
+        # Check issue-specific logs
+        for log_file in self.run_log_dir.glob("*.log"):
+            if log_file.name == "main.log":
+                continue
+
+            with open(log_file, 'r') as f:
+                for line_num, line in enumerate(f, 1):
+                    # Check for errors
+                    for pattern in error_patterns:
+                        if re.search(pattern, line):
+                            llm_errors.append((log_file.name, line_num, line.strip()))
+                            break
+                    # Check for successes
+                    for pattern in success_patterns:
+                        if re.search(pattern, line):
+                            llm_successes += 1
+                            break
+
+        # Report statistics
+        total_calls = llm_successes + len(llm_errors)
+
+        logger.info(f"\n📊 LLM Call Statistics:")
+        logger.info(f"  Total LLM calls: {total_calls}")
+        logger.info(f"  ✅ Successful: {llm_successes}")
+        logger.info(f"  ❌ Failed: {len(llm_errors)}")
+
+        if total_calls > 0:
+            success_rate = (llm_successes / total_calls) * 100
+            logger.info(f"  Success rate: {success_rate:.1f}%")
+
+        if llm_errors:
+            logger.warning(f"\n⚠️  LLM Error Details ({len(llm_errors)} errors):")
+            for log_file, line_num, line in llm_errors[:10]:  # Show first 10
+                logger.warning(f"  {log_file}:{line_num} - {line[:100]}")
+            if len(llm_errors) > 10:
+                logger.warning(f"  ... and {len(llm_errors) - 10} more errors")
+            logger.warning(f"  Check logs in: {self.run_log_dir}")
 
 
 def main():

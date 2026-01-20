@@ -189,7 +189,33 @@ class PatternLearningPipeline:
             issue_types=self.issue_types
         )
 
+        # Setup main log file in the run_log_dir
+        self._setup_main_log_file(orchestrator.run_log_dir)
+
         return orchestrator.run_phase1()
+
+    def _setup_main_log_file(self, run_log_dir: Path) -> None:
+        """
+        Setup main log file handler to write to run_log_dir/main.log.
+
+        Args:
+            run_log_dir: Run-specific log directory
+        """
+        main_log_file = run_log_dir / "main.log"
+
+        # Add file handler to root logger
+        file_handler = logging.FileHandler(main_log_file)
+        file_handler.setLevel(logging.INFO)
+        file_handler.setFormatter(logging.Formatter(
+            "%(asctime)s - %(levelname)s - %(message)s"
+        ))
+
+        # Get root logger and add handler
+        root_logger = logging.getLogger()
+        root_logger.addHandler(file_handler)
+
+        logger.info(f"Main log file: {main_log_file}")
+        self.main_log_file = main_log_file
 
     def run_phase1_5(self, phase1_results: Dict) -> Dict:
         """Run Phase 1.5: Evaluate final refined patterns on validation set."""

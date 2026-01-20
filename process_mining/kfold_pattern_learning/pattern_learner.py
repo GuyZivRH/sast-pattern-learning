@@ -123,27 +123,42 @@ class PatternLearner:
         logger.info(f"Learning patterns for {issue_type}...")
         logger.info(f"  Processing {len(train_files)} training files")
         logger.info(f"  Balanced sampling: {max_tp_per_batch} TP + {max_fp_per_batch} FP")
+        print(f"DEBUG [{issue_type}]: Starting pattern learning with {len(train_files)} files", flush=True)
 
         # Parse all entries from training files
         parser = ValidationEntryParser()
         all_entries = []
 
-        for txt_file in train_files:
+        # Report first few files being parsed
+        file_names = [f.stem for f in train_files[:5]]
+        if len(train_files) > 5:
+            logger.info(f"  Parsing {len(train_files)} files: {', '.join(file_names)}... (+{len(train_files)-5} more)")
+        else:
+            logger.info(f"  Parsing {len(train_files)} files: {', '.join(file_names)}")
+
+        print(f"DEBUG [{issue_type}]: Parsing {len(train_files)} files...", flush=True)
+        for idx, txt_file in enumerate(train_files):
             try:
                 entries = parser.parse_file(txt_file)
                 all_entries.extend(entries)
+                if (idx + 1) % 50 == 0:
+                    print(f"DEBUG [{issue_type}]: Parsed {idx + 1}/{len(train_files)} files, {len(all_entries)} entries so far", flush=True)
             except Exception as e:
                 logger.warning(f"Failed to parse {txt_file.name}: {e}")
                 continue
+
+        print(f"DEBUG [{issue_type}]: File parsing complete, {len(all_entries)} total entries", flush=True)
 
         # Filter to specific issue type
         issue_entries = [e for e in all_entries if e.issue_type == issue_type]
 
         if not issue_entries:
             logger.warning(f"No entries found for issue type: {issue_type}")
+            print(f"DEBUG [{issue_type}]: No entries found - returning empty patterns", flush=True)
             return {"fp": [], "tp": []}
 
         logger.info(f"  Found {len(issue_entries)} total entries for {issue_type}")
+        print(f"DEBUG [{issue_type}]: Found {len(issue_entries)} entries for this issue type", flush=True)
 
         # Separate TP and FP
         tp_entries = [e for e in issue_entries if 'TRUE' in e.ground_truth_classification]
@@ -182,25 +197,30 @@ class PatternLearner:
         logger.info(f"  Processing {len(fp_batches)} batches (TP used in each)")
 
         # Process each batch
+        print(f"DEBUG [{issue_type}]: Processing {len(fp_batches)} batches...", flush=True)
         for batch_idx, fp_batch in enumerate(fp_batches):
             # Combine TP + FP for this batch
             batch_entries = sampled_tp + fp_batch
             random.shuffle(batch_entries)
 
             logger.info(f"  Batch {batch_idx + 1}/{len(fp_batches)}: {len(sampled_tp)} TP + {len(fp_batch)} FP")
+            print(f"DEBUG [{issue_type}]: Batch {batch_idx + 1}/{len(fp_batches)} - {len(sampled_tp)} TP + {len(fp_batch)} FP", flush=True)
 
             # Build learning prompt
             prompt = self._build_learning_prompt(batch_entries, issue_type)
+            print(f"DEBUG [{issue_type}]: Built prompt, length: {len(prompt)} chars", flush=True)
 
             # Call LLM
             try:
                 logger.info(f"    Calling LLM to generate patterns...")
+                print(f"DEBUG [{issue_type}]: Calling LLM API (platform: {self.classifier.platform})...", flush=True)
 
                 # Respect rate limits
                 self.classifier._wait_for_rate_limit()
 
                 # Platform-aware API call
                 if self.classifier.platform == "vertex":
+                    print(f"DEBUG [{issue_type}]: Making Vertex AI API call...", flush=True)
                     response = self.classifier.client.messages.create(
                         model=self.model,
                         max_tokens=self.max_tokens,
@@ -208,8 +228,10 @@ class PatternLearner:
                         messages=[{"role": "user", "content": prompt}]
                     )
                     response_text = response.content[0].text
+                    print(f"DEBUG [{issue_type}]: Vertex AI response received, length: {len(response_text)} chars", flush=True)
                 else:
                     # OpenAI-compatible API (local, nim)
+                    print(f"DEBUG [{issue_type}]: Making OpenAI-compatible API call...", flush=True)
                     response = self.classifier.client.chat.completions.create(
                         model=self.model,
                         max_tokens=self.max_tokens,
@@ -217,6 +239,7 @@ class PatternLearner:
                         messages=[{"role": "user", "content": prompt}]
                     )
                     response_text = response.choices[0].message.content
+                    print(f"DEBUG [{issue_type}]: API response received, length: {len(response_text)} chars", flush=True)
 
                 if response_text is None:
                     raise ValueError("LLM returned empty response")
@@ -229,9 +252,11 @@ class PatternLearner:
                 all_patterns["tp"].extend(batch_patterns.get("tp", []))
 
                 logger.info(f"    Generated {len(batch_patterns.get('fp', []))} FP, {len(batch_patterns.get('tp', []))} TP patterns")
+                print(f"DEBUG [{issue_type}]: Batch {batch_idx + 1} complete - {len(batch_patterns.get('fp', []))} FP, {len(batch_patterns.get('tp', []))} TP patterns", flush=True)
 
             except Exception as e:
                 logger.error(f"    Error calling LLM for batch {batch_idx + 1}: {e}")
+                print(f"DEBUG [{issue_type}]: ERROR in batch {batch_idx + 1}: {e}", flush=True)
                 continue
 
         # Deduplicate and renumber patterns

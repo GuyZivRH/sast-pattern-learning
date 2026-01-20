@@ -126,12 +126,29 @@ class PatternBasedClassifier:
         self._request_times: deque = deque()
         self._rate_limit_lock = Lock()
 
-        print(f"Using platform: {platform} ({self.model})")
-        if self.rate_limit:
-            print(f"Rate limit: {self.rate_limit} requests/minute")
+        # Suppress verbose output during parallel processing
+        # print(f"Using platform: {platform} ({self.model})")
+        # if self.rate_limit:
+        #     print(f"Rate limit: {self.rate_limit} requests/minute")
 
         self.patterns_by_issue_type: Dict[str, str] = {}
         self.prompt_template = ""
+
+    def _record_llm_success(self, issue_type: str = "unknown", operation: str = "classify") -> None:
+        """Record successful LLM call (delegates to orchestrator if available)."""
+        try:
+            from process_mining.kfold_pattern_learning.kfold_orchestrator import KFoldOrchestrator
+            KFoldOrchestrator._record_llm_success(issue_type=issue_type, operation=operation)
+        except Exception:
+            pass  # Ignore if orchestrator not available (e.g., standalone usage)
+
+    def _record_llm_failure(self, issue_type: str = "unknown", operation: str = "classify", error: str = "") -> None:
+        """Record failed LLM call (delegates to orchestrator if available)."""
+        try:
+            from process_mining.kfold_pattern_learning.kfold_orchestrator import KFoldOrchestrator
+            KFoldOrchestrator._record_llm_failure(issue_type=issue_type, operation=operation, error=error)
+        except Exception:
+            pass  # Ignore if orchestrator not available (e.g., standalone usage)
 
     def load_patterns(self, patterns_dir: Optional[Path] = None) -> None:
         """
@@ -418,6 +435,10 @@ Your response must start with ```json and end with ```
 
             classification, justification, cited_patterns = self._parse_response(response_text)
 
+            # Record successful LLM call
+            issue_type = masked_entry.get('issue_type', 'unknown')
+            self._record_llm_success(issue_type=issue_type, operation="classify")
+
             return ClassificationResult(
                 predicted_classification=classification,
                 predicted_justification=justification,
@@ -427,6 +448,10 @@ Your response must start with ```json and end with ```
             )
 
         except Exception as e:
+            # Record failed LLM call
+            issue_type = masked_entry.get('issue_type', 'unknown')
+            self._record_llm_failure(issue_type=issue_type, operation="classify", error=str(e))
+
             print(f"Error classifying entry: {e}")
             return ClassificationResult(
                 predicted_classification="ERROR",

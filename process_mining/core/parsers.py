@@ -35,7 +35,9 @@ class ValidationEntryParser:
 
         entries = self._split_entries(content, package_name)
 
-        print(f"Entries with valid source code: {len(entries)}, Skipped (no source code): {self.skipped_no_source_code}")
+        # Suppress verbose output during parallel processing
+        # Commenting this out to avoid flooding stdout during parallel processing
+        # print(f"Entries with valid source code: {len(entries)}, Skipped (no source code): {self.skipped_no_source_code}")
 
         return entries
 
