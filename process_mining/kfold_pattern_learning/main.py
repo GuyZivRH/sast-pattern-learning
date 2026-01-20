@@ -111,6 +111,13 @@ class PatternLearningPipeline:
 
         phase1_results = self.run_phase1()
 
+        # Phase 1.5: Evaluate final patterns on validation set
+        logger.info("\n" + "="*80)
+        logger.info("STARTING PHASE 1.5: FINAL PATTERN EVALUATION")
+        logger.info("="*80)
+
+        phase1_5_results = self.run_phase1_5(phase1_results)
+
         # Phase 2: Iterative Refinement
         logger.info("\n" + "="*80)
         logger.info("STARTING PHASE 2: ITERATIVE REFINEMENT")
@@ -171,7 +178,7 @@ class PatternLearningPipeline:
         return complete_results
 
     def run_phase1(self) -> Dict:
-        """Run Phase 1: K-Fold Cross-Validation."""
+        """Run Phase 1: K-Fold Cross-Validation with Iterative Refinement."""
         orchestrator = KFoldOrchestrator(
             train_dir=self.train_dir,
             output_dir=self.output_dir,
@@ -184,12 +191,34 @@ class PatternLearningPipeline:
 
         return orchestrator.run_phase1()
 
+    def run_phase1_5(self, phase1_results: Dict) -> Dict:
+        """Run Phase 1.5: Evaluate final refined patterns on validation set."""
+        # Extract final patterns from Phase 1
+        final_patterns_by_issue_type = {}
+        for issue_type, data in phase1_results.get('issue_types', {}).items():
+            final_patterns_by_issue_type[issue_type] = data.get('final_patterns', {"fp": [], "tp": []})
+
+        orchestrator = KFoldOrchestrator(
+            train_dir=self.train_dir,
+            output_dir=self.output_dir,
+            n_folds=self.n_folds,
+            platform=self.platform,
+            random_seed=self.random_seed,
+            workers=self.workers,
+            issue_types=self.issue_types
+        )
+
+        return orchestrator.run_phase1_5(
+            final_patterns_by_issue_type=final_patterns_by_issue_type,
+            val_dir=self.val_dir
+        )
+
     def run_phase2(self, phase1_results: Dict) -> Dict:
-        """Run Phase 2: Iterative Refinement."""
-        # Extract merged patterns by issue type
+        """Run Phase 2: Further Iterative Refinement on train+val."""
+        # Extract final patterns from Phase 1 (patterns_2)
         initial_patterns_by_issue_type = {}
         for issue_type, data in phase1_results.get('issue_types', {}).items():
-            initial_patterns_by_issue_type[issue_type] = data.get('merged_patterns', {"fp": [], "tp": []})
+            initial_patterns_by_issue_type[issue_type] = data.get('final_patterns', {"fp": [], "tp": []})
 
         orchestrator = RefinementOrchestrator(
             train_dir=self.train_dir,
@@ -324,7 +353,7 @@ class PatternLearningPipeline:
             phase3_results = complete_results['phase3_results']
 
             for issue_type in phase3_results.get('issue_types', {}).keys():
-                phase1_f1 = phase1_results['issue_types'][issue_type]['avg_metrics']['f1']
+                phase1_f1 = phase1_results['issue_types'][issue_type]['final_metrics'].get('f1', 0.0)
                 phase2_iters = phase2_results['issue_types'][issue_type]['convergence_info']['iterations_completed']
                 phase2_improvement = phase2_results['issue_types'][issue_type]['convergence_info']['f1_improvement']
                 phase3_f1 = phase3_results['issue_types'][issue_type]['metrics']['f1']
@@ -404,7 +433,7 @@ Examples:
     parser.add_argument("--output-dir", type=Path, required=True,
                        help="Output directory for results")
 
-    parser.add_argument("--platform", "-p", choices=["local", "nim"],
+    parser.add_argument("--platform", "-p", choices=["local", "nim", "vertex"],
                        default="nim", help="LLM platform")
     parser.add_argument("--n-folds", type=int, default=5,
                        help="Number of folds for k-fold CV")

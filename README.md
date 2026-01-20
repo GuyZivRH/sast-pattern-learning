@@ -8,14 +8,20 @@ A 3-phase machine learning pipeline for learning and refining SAST false positiv
 
 ```bash
 # Run complete pipeline on your data
-python main.py \
-  --train-dir process_mining/full_pattern_data/train \
-  --val-dir process_mining/full_pattern_data/val \
-  --test-dir process_mining/full_pattern_data/test \
-  --output-dir output/kfold_learning \
-  --platform nim \
-  --n-folds 5 \
-  --max-iterations 10
+python -m process_mining.kfold_pattern_learning.main \
+  --train-dir data/train \
+  --val-dir data/val \
+  --test-dir data/test \
+  --output-dir outputs/kfold_learning \
+  --platform vertex \
+  --n-folds 3 \
+  --max-iterations 10 \
+  --workers 4
+```
+
+**Quick test with sample data**:
+```bash
+./run_sample_e2e.sh  # Runs on small sample dataset (~30-45 min)
 ```
 
 **Expected runtime**: ~30-60 minutes per issue type (depends on LLM rate limits)
@@ -51,7 +57,7 @@ Phase 1: K-Fold CV        Phase 2: Refinement       Phase 3: Final Test
 (on train/ 60%)          (train + val, 80%)        (test/ 20%)
      │                          │                          │
      ├─► Learn patterns         ├─► Refine on TRAIN       ├─► Final metrics
-     │   from 5 folds           │   Validate on VAL       │   on held-out test
+     │   from 3 folds           │   Validate on VAL       │   on held-out test
      └─► Merge best ────────────┴─► Converge ─────────────┴─► Report
 ```
 
@@ -119,17 +125,32 @@ ls process_mining/full_pattern_data/test   # 39 packages
 
 **How to split your data**:
 ```bash
-# Option 1: Manual split (recommended)
-# Ensure balanced FP/TP ratio in each split
+# Option 1: Use the stratified data splitter (recommended)
+# Stratifies by (issue_type, classification) to maintain distribution
+python -m process_mining.kfold_pattern_learning.stratified_data_splitter \
+  source_dir/ \
+  output_dir/ \
+  --train 0.6 \
+  --val 0.2 \
+  --test 0.2 \
+  --seed 42
 
-# Option 2: Random split (quick, but may be imbalanced)
-python scripts/split_data.py \
-  --input-dir all_data/ \
-  --train-ratio 0.6 \
-  --val-ratio 0.2 \
-  --test-ratio 0.2 \
-  --output-dir process_mining/full_pattern_data/
+# Option 2: Include all issue types (default: top 10 only)
+python -m process_mining.kfold_pattern_learning.stratified_data_splitter \
+  source_dir/ \
+  output_dir/ \
+  --all-types
+
+# Option 3: Manual split
+# Ensure balanced FP/TP ratio in each split
 ```
+
+**Stratified splitting ensures**:
+- Each (issue_type, classification) group is distributed across train/val/test
+- Maintains TP/FP balance for each issue type in all splits
+- All issue types appear in train, val, and test (when possible)
+- By default, filters to top 10 issue types for pattern learning
+- No data leakage between splits
 
 ---
 
@@ -157,7 +178,7 @@ python scripts/split_data.py \
    ┌────▼──────────────────▼───┐             │
    │   PHASE 1: K-FOLD CV       │             │
    │   (Learn from train/)      │             │
-   │   • 5 folds × 80/20 split  │             │
+   │   • 3 folds (stratified)   │             │
    │   • Learn patterns         │             │
    │   • Merge best patterns    │             │
    └────────────┬───────────────┘             │
@@ -186,138 +207,187 @@ python scripts/split_data.py \
 
 ---
 
-## Phase 1: K-Fold Cross-Validation
+## Phase 1: K-Fold Cross-Validation with Iterative Refinement
 
 ### Goal
-Learn initial patterns from training data using k-fold cross-validation.
+Learn and refine patterns using k-fold cross-validation with iterative refinement across fold combinations.
 
 ### Input
-- `train/` directory (60% of original data)
+- `train/` directory (60% of original data, package files)
 - Issue type (e.g., `RESOURCE_LEAK`)
 
 ### Process
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│ Step 1: Stratified K-Fold Split (n=5 folds)                 │
+│ Initialization: Stratified K-Fold Split (n=3 folds)         │
 ├─────────────────────────────────────────────────────────────┤
-│ Input: 118 files from train/                                │
+│ Input: Package files from train/                            │
 │                                                              │
-│ StratifiedKFoldSplitter:                                     │
-│   1. Analyze each file → count issues, FP ratio             │
-│   2. Assign strata: {size}_{fp_bucket}                      │
-│      • size: small/medium/large (by issue count)            │
-│      • fp_bucket: low/medium/high (by FP ratio)             │
-│   3. Distribute files across 5 folds evenly                 │
+│ StratifiedKFoldSplitter (stratified_kfold.py):              │
+│   Strategy: PACKAGE-level splitting (no contamination)      │
 │                                                              │
-│ Output: 5 folds, each with:                                 │
-│   • train_files (80% of train/ = ~94 files)                 │
-│   • val_files (20% of train/ = ~24 files)                   │
+│   1. Load ALL package files and compute statistics          │
+│      • Count TP/FP per package                              │
+│      • Identify primary issue type per package              │
+│   2. Group packages by primary issue type                   │
+│   3. For each issue type:                                   │
+│      • Distribute packages evenly across k folds            │
+│      • Each package goes entirely into ONE fold             │
+│   4. Return original package files (no temp files)          │
+│                                                              │
+│ Output: 3 folds, each containing ~33% of packages           │
+│   • Fold 0: 42 packages (e.g., 67 TP, 289 FP)              │
+│   • Fold 1: 42 packages (e.g., 68 TP, 290 FP)              │
+│   • Fold 2: 41 packages (e.g., 65 TP, 289 FP)              │
+│                                                              │
+│ Guarantees:                                                  │
+│   • Every fold contains EVERY issue type                    │
+│   • NO package contamination (unique packages per fold)     │
+│   • Fails if any issue type has < n_folds packages          │
 └─────────────────────────────────────────────────────────────┘
                            ▼
 ┌─────────────────────────────────────────────────────────────┐
-│ Step 2: Learn Patterns for Each Fold (5 iterations)         │
+│ Step 0: Learn Initial Patterns                              │
 ├─────────────────────────────────────────────────────────────┤
-│ For each fold (0-4):                                         │
+│ Train: Folds 0,1 (84 packages)                              │
+│ Validate: Fold 2 (41 packages)                              │
 │                                                              │
-│   A. PATTERN LEARNING (PatternLearner)                      │
-│      ─────────────────────────────────                       │
-│      train_files (94 files) → PatternLearner                │
-│        1. Parse ALL entries from all 94 files               │
-│        2. Filter to issue_type (e.g., RESOURCE_LEAK)        │
-│           → Found: 1068 entries                             │
-│        3. Random sample if > 50 entries                     │
-│           → Shuffle & take first 50 entries                 │
-│           → Why 50? Token limit (~10k tokens for input)     │
-│        4. Build LLM prompt with 50 entries                  │
-│           → ~25 FP examples                                 │
-│           → ~25 TP examples                                 │
-│        5. LLM generates patterns                            │
-│           → Response: {"fp": [...], "tp": [...]}            │
+│ A. PATTERN LEARNING (PatternLearner)                        │
+│    train_files (folds 0+1) → PatternLearner                 │
+│      1. Parse ALL entries from train files                  │
+│      2. Filter to issue_type (e.g., RESOURCE_LEAK)          │
+│         → Found: 712 entries (135 TP, 577 FP)               │
+│      3. Batch processing strategy (processes ALL data):     │
+│         • TP: Sample 3 with replacement → 3 TP              │
+│         • FP: Process ALL in sliding batches of 3           │
+│           - Batch 1: FP[0:3]                                │
+│           - Batch 2: FP[3:6]                                │
+│           - ...                                             │
+│           - Batch 192: FP[576:577] + 2 sampled              │
+│           - Total: 577 FP in 192 batches                    │
+│      4. For each batch: 3 TP + 3 FP → LLM generates patterns│
+│      5. Deduplicate patterns by summary                     │
 │                                                              │
-│      Save: RESOURCE_LEAK_fold_0_patterns.json               │
+│ B. VALIDATION EVALUATION (FoldEvaluator)                    │
+│    patterns_0 + val_files (fold 2) → Evaluate               │
+│      • Evaluate on ALL entries in fold 2 (no sampling)      │
+│      • Calculate metrics: F1, Precision, Recall             │
 │                                                              │
-│   B. FOLD EVALUATION (FoldEvaluator)                        │
-│      ─────────────────────────                               │
-│      val_files (24 files) + fold_patterns → Evaluate        │
-│        1. Parse ALL entries from val_files                  │
-│           (NO sampling - evaluate on ALL data)              │
-│        2. For each entry:                                   │
-│           • LLM classifies using learned patterns           │
-│           • Compare with ground truth                       │
-│        3. Calculate metrics: F1, Precision, Recall          │
-│                                                              │
-│      Save: RESOURCE_LEAK_fold_0_evaluation.json             │
-│        • metrics: {f1, precision, recall, accuracy}         │
-│        • confusion_matrix                                   │
-│        • per-entry results                                  │
+│ Output:                                                      │
+│   • RESOURCE_LEAK_step_0_patterns.json                      │
+│   • RESOURCE_LEAK_step_0_evaluation.json                    │
+│   • Val F1: 0.750                                           │
 └─────────────────────────────────────────────────────────────┘
                            ▼
 ┌─────────────────────────────────────────────────────────────┐
-│ Step 3: Merge Patterns Across Folds (PatternMerger)         │
+│ Step 1: Refine Patterns                                     │
 ├─────────────────────────────────────────────────────────────┤
-│ Input: 5 pattern files                                       │
-│   • fold_0_patterns.json (4 FP, 3 TP patterns)              │
-│   • fold_1_patterns.json (5 FP, 4 TP patterns)              │
-│   • fold_2_patterns.json (3 FP, 3 TP patterns)              │
-│   • fold_3_patterns.json (4 FP, 3 TP patterns)              │
-│   • fold_4_patterns.json (4 FP, 4 TP patterns)              │
+│ Train: Folds 0,2 (83 packages)                              │
+│ Validate: Fold 1 (42 packages)                              │
 │                                                              │
-│ LLM Deduplication:                                           │
-│   • Identify duplicate patterns (same code idiom)           │
-│   • Preserve unique patterns                                │
-│   • Combine insights from duplicates                        │
-│   • Renumber pattern IDs sequentially                       │
+│ A. TRAIN EVALUATION (find misclassifications)               │
+│    patterns_0 + train_files (folds 0+2) → FoldEvaluator     │
+│      • Evaluate current patterns on training data           │
+│      • Find misclassified entries                           │
+│      • Sample max 20 misclassifications                     │
 │                                                              │
-│ Output: RESOURCE_LEAK_merged_patterns.json                  │
-│   • ~5-7 unique FP patterns (after dedup)                   │
-│   • ~4-5 unique TP patterns (after dedup)                   │
+│ B. PATTERN REFINEMENT (PatternRefiner)                      │
+│    patterns_0 + misclassified → PatternRefiner              │
+│      • Analyze misclassifications (FN vs FP-missed)         │
+│      • LLM suggests refinements:                            │
+│        - Add: New patterns for uncovered cases              │
+│        - Modify: Improve existing patterns                  │
+│        - Remove: Delete redundant patterns                  │
+│      • Apply refinements → patterns_1                       │
 │                                                              │
-│ Metrics: Average F1 across 5 folds                          │
-│   avg_f1 = mean([0.72, 0.75, 0.71, 0.74, 0.73]) = 0.73     │
+│ C. VALIDATION EVALUATION                                    │
+│    patterns_1 + val_files (fold 1) → Evaluate               │
+│      • Evaluate refined patterns on fold 1                  │
+│      • Calculate metrics: F1, Precision, Recall             │
+│                                                              │
+│ Output:                                                      │
+│   • RESOURCE_LEAK_step_1_patterns.json                      │
+│   • RESOURCE_LEAK_step_1_refinements.json                   │
+│   • RESOURCE_LEAK_step_1_evaluation.json                    │
+│   • Val F1: 0.780                                           │
 └─────────────────────────────────────────────────────────────┘
                            ▼
-                  MERGED PATTERNS
-               (Input to Phase 2)
+┌─────────────────────────────────────────────────────────────┐
+│ Step 2: Further Refinement                                  │
+├─────────────────────────────────────────────────────────────┤
+│ Train: Folds 1,2 (83 packages)                              │
+│ Validate: Fold 0 (42 packages)                              │
+│                                                              │
+│ A. TRAIN EVALUATION (find misclassifications)               │
+│    patterns_1 + train_files (folds 1+2) → FoldEvaluator     │
+│      • Evaluate on different fold combination               │
+│      • Find misclassified entries                           │
+│      • Sample max 20 misclassifications                     │
+│                                                              │
+│ B. PATTERN REFINEMENT (PatternRefiner)                      │
+│    patterns_1 + misclassified → PatternRefiner              │
+│      • Analyze new misclassifications                       │
+│      • LLM suggests refinements                             │
+│      • Apply refinements → patterns_2                       │
+│                                                              │
+│ C. VALIDATION EVALUATION                                    │
+│    patterns_2 + val_files (fold 0) → Evaluate               │
+│      • Evaluate on fold 0                                   │
+│      • Calculate final metrics                              │
+│                                                              │
+│ Output:                                                      │
+│   • RESOURCE_LEAK_step_2_patterns.json (FINAL)              │
+│   • RESOURCE_LEAK_step_2_refinements.json                   │
+│   • RESOURCE_LEAK_step_2_evaluation.json                    │
+│   • Val F1: 0.795                                           │
+└─────────────────────────────────────────────────────────────┘
+                           ▼
+                  FINAL PATTERNS (patterns_2)
+               (Input to Phase 1.5)
 ```
 
 ### Key Details
 
 **Q: How many entries are used for learning?**
-A: **Maximum 50 entries per issue type per fold** (randomly sampled if more)
+A: **ALL entries** are processed in batches of 6 (3 TP + 3 FP). For 868 FP entries, this creates ~290 batches and 290 LLM calls.
 
 **Q: How many entries are used for evaluation?**
 A: **ALL entries** in the validation fold (no sampling)
 
 **Q: What's the train/val split per fold?**
-A: **80% train, 20% val** (e.g., 94 files train, 24 files val)
+A: **~67% train, ~33% val** per fold (2 folds train, 1 fold val)
 
-**Q: Why sample to 50 entries?**
-A: **LLM context window limit**. 50 entries ≈ 10k tokens, leaving room for LLM response.
+**Q: Why batch size of 6?**
+A: **LLM context window + balanced TP/FP**. 6 entries ≈ 2k tokens, allowing for rich pattern generation while maintaining balance.
 
 ### Output
 
 ```
 output/phase1_kfold_results/
-├── RESOURCE_LEAK_fold_0_patterns.json      # Patterns learned from fold 0
-├── RESOURCE_LEAK_fold_0_evaluation.json    # Fold 0 evaluation metrics
-├── RESOURCE_LEAK_fold_1_patterns.json
-├── RESOURCE_LEAK_fold_1_evaluation.json
-├── ...
-├── RESOURCE_LEAK_merged_patterns.json      # ⭐ Deduplicated patterns
-└── phase1_complete_results.json            # Complete Phase 1 results
+├── RESOURCE_LEAK_step_0_patterns.json       # Initial patterns (Step 0)
+├── RESOURCE_LEAK_step_0_evaluation.json     # Step 0 validation metrics
+├── RESOURCE_LEAK_step_1_patterns.json       # Refined patterns (Step 1)
+├── RESOURCE_LEAK_step_1_refinements.json    # Step 1 refinement details
+├── RESOURCE_LEAK_step_1_evaluation.json     # Step 1 validation metrics
+├── RESOURCE_LEAK_step_2_patterns.json       # ⭐ Final patterns (Step 2)
+├── RESOURCE_LEAK_step_2_refinements.json    # Step 2 refinement details
+├── RESOURCE_LEAK_step_2_evaluation.json     # Step 2 validation metrics
+├── RESOURCE_LEAK_final_evaluation.json      # Phase 1.5: Final pattern baseline on full val set
+├── phase1_5_final_evaluation.json           # Phase 1.5: All issue types combined
+└── phase1_complete_results.json             # Complete Phase 1 results
 ```
 
 ---
 
-## Phase 2: Iterative Refinement
+## Phase 2: Further Iterative Refinement
 
 ### Goal
-Refine patterns using train+val data with **proper ML pipeline** (no data leakage).
+Further refine patterns using train+val data with **proper ML pipeline** (no data leakage).
 
 ### Input
-- Merged patterns from Phase 1
-- `train/` directory (60% of original) - for refinement
+- Final patterns from Phase 1 (patterns_2 from iterative refinement)
+- `train/` directory (60% of original) - for finding misclassifications
 - `val/` directory (20% of original) - for early stopping
 
 ### Process
@@ -337,13 +407,13 @@ Refine patterns using train+val data with **proper ML pipeline** (no data leakag
 ├─────────────────────────────────────────────────────────────┤
 │ While iteration < max_iterations AND not converged:         │
 │                                                              │
-│   Step A: Evaluate on TRAIN (find refinement targets)       │
-│   ──────────────────────────────────────────────────        │
-│   current_patterns + train/ → FoldEvaluator                 │
-│     • Parse ALL entries from train/ files                   │
-│     • Classify each entry using current patterns            │
-│     • Calculate metrics: train_f1, train_precision, etc.    │
-│     • Track misclassified entries                           │
+│   Step A: Predict & Evaluate on TRAIN (find refinement targets) │
+│   ──────────────────────────────────────────────────────────    │
+│   current_patterns + train/ → FoldEvaluator                     │
+│     • Sample up to 500 entries from train/ files               │
+│     • LLM classifies each entry using current patterns          │
+│     • Calculate metrics: train_f1, train_precision, etc.        │
+│     • Track misclassified entries for refinement               │
 │                                                              │
 │   Example Output:                                            │
 │     Train F1: 0.850                                         │
@@ -351,11 +421,11 @@ Refine patterns using train+val data with **proper ML pipeline** (no data leakag
 │     Train Recall: 0.880                                     │
 │     Train Misclassified: 15 entries                         │
 │                                                              │
-│   Step B: Evaluate on VAL (check generalization)            │
-│   ─────────────────────────────────────────────             │
+│   Step B: Predict & Evaluate on VAL (check generalization)  │
+│   ──────────────────────────────────────────────────────    │
 │   current_patterns + val/ → FoldEvaluator                   │
-│     • Parse ALL entries from val/ files                     │
-│     • Classify each entry using current patterns            │
+│     • Sample up to 500 entries from val/ files              │
+│     • LLM classifies each entry using current patterns      │
 │     • Calculate metrics: val_f1, val_precision, etc.        │
 │                                                              │
 │   Example Output:                                            │
@@ -416,7 +486,7 @@ Refine patterns using train+val data with **proper ML pipeline** (no data leakag
                (Input to Phase 3)
 ```
 
-### ML Best Practices (NEW - 2026-01-18 Fix)
+### ML Best Practices
 
 ✅ **No Data Leakage**: Val set NEVER used for refinement
 ✅ **Early Stopping**: Converges when val F1 stops improving
@@ -549,14 +619,15 @@ output/
 ### Example 1: Run Complete Pipeline
 
 ```bash
-python main.py \
-  --train-dir process_mining/full_pattern_data/train \
-  --val-dir process_mining/full_pattern_data/val \
-  --test-dir process_mining/full_pattern_data/test \
-  --output-dir output/kfold_learning \
+python -m process_mining.kfold_pattern_learning.main \
+  --train-dir data/pattern_data/train \
+  --val-dir data/pattern_data/val \
+  --test-dir data/pattern_data/test \
+  --output-dir outputs/kfold_learning \
   --platform nim \
   --n-folds 5 \
-  --max-iterations 10
+  --max-iterations 10 \
+  --eval-sample-size 500
 ```
 
 **Expected Output**:
@@ -579,10 +650,11 @@ Phase 3: Test evaluation completed in 8.2 minutes
 ### Example 2: Run Only Phase 1 (Pattern Learning)
 
 ```bash
-python main.py \
+python -m process_mining.kfold_pattern_learning.main \
   --phase 1 \
-  --train-dir process_mining/full_pattern_data/train \
-  --output-dir output/phase1_only \
+  --train-dir data/pattern_data/train \
+  --output-dir outputs/phase1_only \
+  --n-folds 3 \
   --issue-types RESOURCE_LEAK UNINIT
 ```
 
@@ -591,12 +663,13 @@ python main.py \
 Requires Phase 1 results to exist first.
 
 ```bash
-python main.py \
+python -m process_mining.kfold_pattern_learning.main \
   --phase 2 \
-  --train-dir process_mining/full_pattern_data/train \
-  --val-dir process_mining/full_pattern_data/val \
-  --output-dir output/phase2_only \
-  --max-iterations 5
+  --train-dir data/pattern_data/train \
+  --val-dir data/pattern_data/val \
+  --output-dir outputs/phase2_only \
+  --max-iterations 5 \
+  --eval-sample-size 100
 ```
 
 ### Example 4: Run Only Phase 3 (Test Evaluation)
@@ -604,10 +677,10 @@ python main.py \
 Requires Phase 2 results to exist first.
 
 ```bash
-python main.py \
+python -m process_mining.kfold_pattern_learning.main \
   --phase 3 \
-  --test-dir process_mining/full_pattern_data/test \
-  --output-dir output/phase3_only
+  --test-dir data/pattern_data/test \
+  --output-dir outputs/phase3_only
 ```
 
 ---
@@ -619,23 +692,40 @@ python main.py \
 | Argument | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `--train-dir` | Yes | - | Training data directory (60% of data) |
-| `--val-dir` | Conditional | - | Validation directory (20%, required for full pipeline) |
-| `--test-dir` | Conditional | - | Test directory (20%, required for full pipeline) |
+| `--val-dir` | Conditional | - | Validation directory (20%, required for Phase 2/3) |
+| `--test-dir` | Conditional | - | Test directory (20%, required for Phase 3) |
 | `--output-dir` | Yes | - | Output directory for all results |
-| `--platform` | No | `nim` | LLM platform: `local` or `nim` |
-| `--n-folds` | No | `5` | Number of folds for k-fold CV |
+| `--platform` | No | `vertex` | LLM platform: `local`, `nim`, or `vertex` (Google Vertex AI)|
+| `--n-folds` | No | `3` | Number of folds for k-fold CV (Phase 1) |
 | `--max-iterations` | No | `10` | Max refinement iterations (Phase 2) |
-| `--workers` | No | `1` | Parallel workers for evaluation |
+| `--eval-sample-size` | No | `500` | Max entries to sample for Phase 2 evaluations (0=no sampling) |
+| `--workers` | No | `1` | Parallel workers for LLM evaluation |
 | `--seed` | No | `42` | Random seed for reproducibility |
-| `--issue-types` | No | auto-detect | Specific issue types (e.g., `RESOURCE_LEAK UNINIT`) |
+| `--issue-types` | No | auto-detect | Specific issue types (space-separated) |
 | `--phase` | No | all | Run specific phase: `1`, `2`, or `3` |
 
 ### Platform Configuration
 
 | Platform | Model | Rate Limit | Use Case |
 |----------|-------|------------|----------|
-| `nim` | `meta/llama-3.3-70b-instruct` | 30 req/min | Production (recommended) |
-| `local` | `llama3.1:70b` | unlimited | Local testing |
+| `vertex` | `claude-sonnet-4-5@20250929` | High (API-dependent) | Production (recommended, fastest) |
+| `nim` | `qwen/qwen3-coder-480b-a35b-instruct` | 30 req/min | NVIDIA NIM platform |
+| `local` | `llama3.1:70b` | Unlimited | Local testing |
+
+**Environment Variables**:
+```bash
+# Vertex AI (Google Cloud)
+export VERTEX_PROJECT_ID="your-gcp-project"
+export VERTEX_REGION="us-east5"
+export VERTEX_MODEL="claude-sonnet-4-5@20250929"
+
+# NVIDIA NIM
+export NIM_API_KEY="your-nvidia-api-key"
+export NIM_MODEL="qwen/qwen3-coder-480b-a35b-instruct"
+
+# Local vLLM
+export LOCAL_BASE_URL="http://localhost:8000/v1"
+```
 
 ---
 
@@ -646,13 +736,17 @@ python main.py \
 ```
 output_dir/
 ├── phase1_kfold_results/
-│   ├── RESOURCE_LEAK_fold_0_patterns.json
-│   ├── RESOURCE_LEAK_fold_0_evaluation.json
-│   ├── RESOURCE_LEAK_fold_1_patterns.json
-│   ├── RESOURCE_LEAK_fold_1_evaluation.json
-│   ├── ...
-│   ├── RESOURCE_LEAK_merged_patterns.json      ← Phase 1 output
-│   └── phase1_complete_results.json
+│   ├── RESOURCE_LEAK_step_0_patterns.json       # Initial patterns (Step 0)
+│   ├── RESOURCE_LEAK_step_0_evaluation.json     # Step 0 validation metrics
+│   ├── RESOURCE_LEAK_step_1_patterns.json       # Refined patterns (Step 1)
+│   ├── RESOURCE_LEAK_step_1_refinements.json    # Step 1 refinement details
+│   ├── RESOURCE_LEAK_step_1_evaluation.json     # Step 1 validation metrics
+│   ├── RESOURCE_LEAK_step_2_patterns.json       # ⭐ Final patterns (Step 2)
+│   ├── RESOURCE_LEAK_step_2_refinements.json    # Step 2 refinement details
+│   ├── RESOURCE_LEAK_step_2_evaluation.json     # Step 2 validation metrics
+│   ├── RESOURCE_LEAK_final_evaluation.json      # Phase 1.5: Final pattern baseline
+│   ├── phase1_5_final_evaluation.json           # Phase 1.5: All issue types combined
+│   └── phase1_complete_results.json             # Complete Phase 1 results
 │
 ├── phase2_refinement_results/
 │   ├── RESOURCE_LEAK_iteration_1_patterns.json
@@ -698,29 +792,46 @@ output_dir/
 
 ### Stratified K-Fold Splitting
 
-**Why stratify?** Ensures each fold has similar FP/TP ratio distribution.
+**Why stratify at package level?** Ensures:
+1. ALL issue types appear in EVERY fold
+2. NO package contamination between folds (each package → one fold only)
+3. Realistic evaluation (packages are independent units)
 
-**9 Strata** based on:
-1. **Size**: small (≤5 issues), medium (≤20), large (>20)
-2. **FP Ratio**: low (<0.25), medium (<0.75), high (≥0.75)
+**Package-Level Stratification Strategy**:
+- Works at **package level** (no contamination)
+- Each package file goes entirely into ONE fold
+- Groups packages by **primary issue type** (most common issue in package)
+- For each issue type:
+  - Distributes packages evenly across k folds
+- **Guarantees**: Every fold contains every issue type with unique packages
 
-**Example**:
+**Example with 3 folds**:
 ```
-Stratum: large_high
-  • Packages with >20 issues AND FP ratio ≥0.75
-  • 12 packages total
-  • Distributed: 2-3 packages per fold
+Issue Type: RESOURCE_LEAK (118 packages)
+  • Fold 0: 39 packages → 67 TP, 289 FP
+  • Fold 1: 40 packages → 68 TP, 290 FP
+  • Fold 2: 39 packages → 65 TP, 289 FP
+
+Issue Type: UNINIT (104 packages)
+  • Fold 0: 35 packages → 48 TP, 152 FP
+  • Fold 1: 35 packages → 49 TP, 151 FP
+  • Fold 2: 34 packages → 47 TP, 150 FP
+
+Result: Each fold contains ALL issue types with UNIQUE packages
+        No package appears in multiple folds (no contamination)
 ```
 
-### Sampling Strategy
+### Batching and Sampling Strategy
 
-| Stage | Data | Sampling | Purpose |
-|-------|------|----------|---------|
-| **Phase 1 Learning** | train_files (80% of fold) | Random 50 entries | Fit LLM context window |
-| **Phase 1 Evaluation** | val_files (20% of fold) | ALL entries | Accurate metrics |
+| Stage | Data | Processing | Purpose |
+|-------|------|------------|---------|
+| **Phase 1 Learning** | train_files (67% of entries) | ALL data in batches of 6 (3 TP + 3 FP) | Process all data for pattern learning |
+| **Phase 1 Evaluation** | val_files (33% of entries) | ALL entries (no sampling) | Accurate fold metrics |
+| **Phase 1.5 Baseline** | val/ (20% of original) | Sample up to 500 entries | Merged pattern baseline |
+| **Phase 2 Train Eval** | train/ (60% of original) | Sample up to 500 entries | Find misclassifications for refinement |
+| **Phase 2 Val Eval** | val/ (20% of original) | Sample up to 500 entries | Early stopping criterion |
 | **Phase 2 Refinement** | train_misclassified | Max 20 entries | LLM refinement suggestions |
-| **Phase 2 Evaluation** | train/ and val/ | ALL entries | Accurate train/val metrics |
-| **Phase 3 Test** | test/ | ALL entries | Final evaluation |
+| **Phase 3 Test** | test/ (20% of original) | ALL entries (no sampling) | Final evaluation |
 
 ### Convergence Criteria (Phase 2)
 

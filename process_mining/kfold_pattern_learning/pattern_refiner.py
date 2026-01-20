@@ -228,14 +228,24 @@ Generate a JSON file with this EXACT structure:
 
             self.classifier._wait_for_rate_limit()
 
-            response = self.classifier.client.chat.completions.create(
-                model=self.model,
-                max_tokens=self.max_tokens,
-                temperature=self.temperature,
-                messages=[{"role": "user", "content": prompt}]
-            )
-
-            response_text = response.choices[0].message.content
+            # Platform-aware API call
+            if self.classifier.platform == "vertex":
+                response = self.classifier.client.messages.create(
+                    model=self.model,
+                    max_tokens=self.max_tokens,
+                    temperature=self.temperature,
+                    messages=[{"role": "user", "content": prompt}]
+                )
+                response_text = response.content[0].text
+            else:
+                # OpenAI-compatible API (local, nim)
+                response = self.classifier.client.chat.completions.create(
+                    model=self.model,
+                    max_tokens=self.max_tokens,
+                    temperature=self.temperature,
+                    messages=[{"role": "user", "content": prompt}]
+                )
+                response_text = response.choices[0].message.content
 
             if response_text is None:
                 raise ValueError("LLM returned empty response")
@@ -422,7 +432,7 @@ def main():
     parser.add_argument("patterns_file", type=Path, help="Current patterns JSON file")
     parser.add_argument("val_dir", type=Path, help="Validation directory")
     parser.add_argument("issue_type", type=str, help="Issue type")
-    parser.add_argument("--platform", "-p", choices=["local", "nim"],
+    parser.add_argument("--platform", "-p", choices=["local", "nim", "vertex"],
                        default="nim", help="LLM platform")
     parser.add_argument("--output", "-o", type=Path, help="Output refinements file")
 

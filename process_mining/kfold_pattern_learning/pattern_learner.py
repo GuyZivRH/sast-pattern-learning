@@ -151,50 +151,96 @@ class PatternLearner:
 
         logger.info(f"  Available: {len(tp_entries)} TP, {len(fp_entries)} FP")
 
-        # Balanced sampling with replacement for sparse classes
-        sampled_tp = self._sample_with_replacement(tp_entries, max_tp_per_batch)
-        sampled_fp = self._sample_with_replacement(fp_entries, max_fp_per_batch)
-
-        # Combine for balanced batch
+        # Process ALL data in batches
+        # Strategy: TP used once (with replacement if < 3), FP in sliding batches of 3
         import random
-        issue_entries = sampled_tp + sampled_fp
-        random.shuffle(issue_entries)  # Mix TP and FP
 
-        logger.info(f"  Sampled: {len(sampled_tp)} TP, {len(sampled_fp)} FP (total: {len(issue_entries)})")
+        all_patterns = {"fp": [], "tp": []}
 
-        # Build learning prompt
-        prompt = self._build_learning_prompt(issue_entries, issue_type)
+        # Handle TP: process once (they're typically fewer)
+        sampled_tp = self._sample_with_replacement(tp_entries, max_tp_per_batch)
 
-        # Call LLM
-        try:
-            logger.info(f"  Calling LLM to generate patterns...")
+        # Process FP in batches of 3
+        fp_batches = []
+        fp_idx = 0
+        while fp_idx < len(fp_entries):
+            batch = fp_entries[fp_idx:fp_idx + max_fp_per_batch]
 
-            # Respect rate limits (handled by classifier's _wait_for_rate_limit)
-            self.classifier._wait_for_rate_limit()
+            # If batch < 3, sample with replacement to reach 3
+            if len(batch) < max_fp_per_batch and len(fp_entries) > 0:
+                extras_needed = max_fp_per_batch - len(batch)
+                extras = random.choices(fp_entries, k=extras_needed)
+                batch = batch + extras
 
-            response = self.classifier.client.chat.completions.create(
-                model=self.model,
-                max_tokens=self.max_tokens,
-                temperature=self.temperature,
-                messages=[{"role": "user", "content": prompt}]
-            )
+            fp_batches.append(batch)
+            fp_idx += max_fp_per_batch
 
-            response_text = response.choices[0].message.content
+        # If no FP entries, create one empty batch to still extract TP patterns
+        if not fp_batches:
+            fp_batches = [[]]
 
-            if response_text is None:
-                raise ValueError("LLM returned empty response")
+        logger.info(f"  Processing {len(fp_batches)} batches (TP used in each)")
 
-            # Parse response
-            patterns = self._parse_pattern_response(response_text, issue_type)
+        # Process each batch
+        for batch_idx, fp_batch in enumerate(fp_batches):
+            # Combine TP + FP for this batch
+            batch_entries = sampled_tp + fp_batch
+            random.shuffle(batch_entries)
 
-            logger.info(f"  Generated {len(patterns.get('fp', []))} FP patterns, "
-                       f"{len(patterns.get('tp', []))} TP patterns")
+            logger.info(f"  Batch {batch_idx + 1}/{len(fp_batches)}: {len(sampled_tp)} TP + {len(fp_batch)} FP")
 
-            return patterns
+            # Build learning prompt
+            prompt = self._build_learning_prompt(batch_entries, issue_type)
 
-        except Exception as e:
-            logger.error(f"Error generating patterns for {issue_type}: {e}")
-            return {"fp": [], "tp": []}
+            # Call LLM
+            try:
+                logger.info(f"    Calling LLM to generate patterns...")
+
+                # Respect rate limits
+                self.classifier._wait_for_rate_limit()
+
+                # Platform-aware API call
+                if self.classifier.platform == "vertex":
+                    response = self.classifier.client.messages.create(
+                        model=self.model,
+                        max_tokens=self.max_tokens,
+                        temperature=self.temperature,
+                        messages=[{"role": "user", "content": prompt}]
+                    )
+                    response_text = response.content[0].text
+                else:
+                    # OpenAI-compatible API (local, nim)
+                    response = self.classifier.client.chat.completions.create(
+                        model=self.model,
+                        max_tokens=self.max_tokens,
+                        temperature=self.temperature,
+                        messages=[{"role": "user", "content": prompt}]
+                    )
+                    response_text = response.choices[0].message.content
+
+                if response_text is None:
+                    raise ValueError("LLM returned empty response")
+
+                # Parse response
+                batch_patterns = self._parse_pattern_response(response_text, issue_type)
+
+                # Accumulate patterns
+                all_patterns["fp"].extend(batch_patterns.get("fp", []))
+                all_patterns["tp"].extend(batch_patterns.get("tp", []))
+
+                logger.info(f"    Generated {len(batch_patterns.get('fp', []))} FP, {len(batch_patterns.get('tp', []))} TP patterns")
+
+            except Exception as e:
+                logger.error(f"    Error calling LLM for batch {batch_idx + 1}: {e}")
+                continue
+
+        # Deduplicate and renumber patterns
+        patterns = self._deduplicate_patterns(all_patterns, issue_type)
+
+        logger.info(f"  Generated {len(patterns.get('fp', []))} FP patterns, "
+                   f"{len(patterns.get('tp', []))} TP patterns")
+
+        return patterns
 
     def _sample_with_replacement(
         self,
@@ -281,6 +327,35 @@ Human Expert Justification: {entry.ground_truth_justification}"""
         prompt += "Remember: Output ONLY the JSON block with no additional text.\n"
 
         return prompt
+
+    def _deduplicate_patterns(self, patterns: Dict, issue_type: str) -> Dict:
+        """
+        Deduplicate patterns and renumber IDs.
+
+        Args:
+            patterns: Dictionary with {"fp": [...], "tp": [...]}
+            issue_type: Issue type for ID prefix
+
+        Returns:
+            Deduplicated patterns with sequential IDs
+        """
+        deduplicated = {"fp": [], "tp": []}
+
+        for category in ["fp", "tp"]:
+            seen_summaries = set()
+            category_prefix = "FP" if category == "fp" else "TP"
+
+            for idx, pattern in enumerate(patterns.get(category, []), 1):
+                # Simple deduplication by summary text
+                summary = pattern.get("summary", "")
+                if summary and summary not in seen_summaries:
+                    seen_summaries.add(summary)
+
+                    # Renumber pattern ID
+                    pattern["pattern_id"] = f"{issue_type}-{category_prefix}-{idx:03d}"
+                    deduplicated[category].append(pattern)
+
+        return deduplicated
 
     def _parse_pattern_response(
         self,

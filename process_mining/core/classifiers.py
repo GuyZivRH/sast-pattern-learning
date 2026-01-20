@@ -21,6 +21,13 @@ except ImportError:
     OPENAI_AVAILABLE = False
     OpenAI = None
 
+try:
+    from anthropic import AnthropicVertex
+    ANTHROPIC_VERTEX_AVAILABLE = True
+except ImportError:
+    ANTHROPIC_VERTEX_AVAILABLE = False
+    AnthropicVertex = None
+
 from process_mining.core.data_models import ClassificationResult
 
 
@@ -37,6 +44,12 @@ PLATFORM_CONFIGS = {
         "api_key": os.getenv("NIM_API_KEY", "your-api-key-here"),
         "model": os.getenv("NIM_MODEL", "qwen/qwen3-coder-480b-a35b-instruct"),
         "rate_limit": int(os.getenv("NIM_RATE_LIMIT", "30")),
+    },
+    "vertex": {
+        "project_id": os.getenv("VERTEX_PROJECT_ID"),
+        "region": os.getenv("VERTEX_REGION"),
+        "model": os.getenv("VERTEX_MODEL"),
+        "rate_limit": int(os.getenv("VERTEX_RATE_LIMIT", "0")) if os.getenv("VERTEX_RATE_LIMIT") else None,
     },
 }
 
@@ -72,22 +85,41 @@ class PatternBasedClassifier:
 
         config = PLATFORM_CONFIGS[platform]
         self.platform = platform
-        self.base_url = base_url or config["base_url"]
-        self.api_key = api_key or config["api_key"]
         self.model = model or config["model"]
         self.max_tokens = max_tokens
         self.temperature = temperature
         self.baseline_mode = baseline_mode
 
-        if OPENAI_AVAILABLE:
-            self.client = OpenAI(
-                base_url=self.base_url,
-                api_key=self.api_key,
-                timeout=120.0,
-                max_retries=3
+        # Initialize client based on platform
+        if platform == "vertex":
+            if not ANTHROPIC_VERTEX_AVAILABLE:
+                raise RuntimeError("Anthropic Vertex SDK not available. Install with: pip install 'anthropic[vertex]'")
+
+            self.project_id = config["project_id"]
+            self.region = config["region"]
+            self.base_url = None
+            self.api_key = None
+
+            self.client = AnthropicVertex(
+                region=self.region,
+                project_id=self.project_id
             )
         else:
-            self.client = None
+            # OpenAI-compatible platforms (local, nim)
+            self.base_url = base_url or config.get("base_url")
+            self.api_key = api_key or config.get("api_key")
+            self.project_id = None
+            self.region = None
+
+            if OPENAI_AVAILABLE:
+                self.client = OpenAI(
+                    base_url=self.base_url,
+                    api_key=self.api_key,
+                    timeout=120.0,
+                    max_retries=3
+                )
+            else:
+                self.client = None
 
         # Rate limiting setup
         self.rate_limit = config.get("rate_limit")
@@ -347,21 +379,39 @@ Your response must start with ```json and end with ```
         prompt = self._build_classification_prompt(masked_entry)
 
         try:
-            if not OPENAI_AVAILABLE or self.client is None:
-                raise RuntimeError("OpenAI SDK not available. Install with: pip install openai")
-
             self._wait_for_rate_limit()
 
-            response = self.client.chat.completions.create(
-                model=self.model,
-                max_tokens=self.max_tokens,
-                temperature=self.temperature,
-                messages=[
-                    {"role": "user", "content": prompt}
-                ]
-            )
+            if self.platform == "vertex":
+                # Use Anthropic Vertex AI API
+                if not ANTHROPIC_VERTEX_AVAILABLE or self.client is None:
+                    raise RuntimeError("Anthropic Vertex SDK not available. Install with: pip install 'anthropic[vertex]'")
 
-            response_text = response.choices[0].message.content
+                response = self.client.messages.create(
+                    model=self.model,
+                    max_tokens=self.max_tokens,
+                    temperature=self.temperature,
+                    messages=[
+                        {"role": "user", "content": prompt}
+                    ]
+                )
+
+                response_text = response.content[0].text
+
+            else:
+                # Use OpenAI-compatible API (local, nim)
+                if not OPENAI_AVAILABLE or self.client is None:
+                    raise RuntimeError("OpenAI SDK not available. Install with: pip install openai")
+
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    max_tokens=self.max_tokens,
+                    temperature=self.temperature,
+                    messages=[
+                        {"role": "user", "content": prompt}
+                    ]
+                )
+
+                response_text = response.choices[0].message.content
 
             if response_text is None:
                 raise ValueError("LLM returned empty response (content is None)")

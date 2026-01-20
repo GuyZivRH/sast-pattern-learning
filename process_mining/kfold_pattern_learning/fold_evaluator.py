@@ -320,7 +320,7 @@ def main():
     parser.add_argument("patterns_file", type=Path, help="Pattern JSON file")
     parser.add_argument("val_dir", type=Path, help="Validation directory")
     parser.add_argument("issue_type", type=str, help="Issue type")
-    parser.add_argument("--platform", "-p", choices=["local", "nim"],
+    parser.add_argument("--platform", "-p", choices=["local", "nim", "vertex"],
                        default="nim", help="LLM platform")
     parser.add_argument("--workers", type=int, default=1, help="Parallel workers")
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")

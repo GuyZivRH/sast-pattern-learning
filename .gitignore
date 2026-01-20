@@ -57,3 +57,4 @@ outputs/
 # Temporary files
 *.tmp
 .temp/sample_pattern_data
+/logs/

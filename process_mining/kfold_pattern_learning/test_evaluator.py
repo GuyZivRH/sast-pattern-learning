@@ -405,7 +405,7 @@ def main():
     parser.add_argument("test_dir", type=Path, help="Test data directory")
     parser.add_argument("output_dir", type=Path, help="Output directory")
     parser.add_argument("phase2_results", type=Path, help="Phase 2 results JSON file")
-    parser.add_argument("--platform", "-p", choices=["local", "nim"],
+    parser.add_argument("--platform", "-p", choices=["local", "nim", "vertex"],
                        default="nim", help="LLM platform")
     parser.add_argument("--workers", type=int, default=1, help="Parallel workers")
     parser.add_argument("--issue-types", nargs="+", help="Specific issue types to evaluate")

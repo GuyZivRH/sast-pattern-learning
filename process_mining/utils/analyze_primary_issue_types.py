@@ -82,7 +82,7 @@ if __name__ == "__main__":
         data_dir = Path(sys.argv[1])
         n_folds = 3
     else:
-        data_dir = Path("data/train")
+        data_dir = Path("../../data/train")
         n_folds = 3
 
     if not data_dir.exists():

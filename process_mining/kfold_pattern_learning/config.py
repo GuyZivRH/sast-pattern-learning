@@ -2,8 +2,7 @@
 """
 K-Fold Pattern Learning Configuration
 
-Centralized configuration constants for the k-fold pattern learning system.
-Replaces hardcoded values scattered across multiple files.
+Centralized configuration for the k-fold pattern learning system.
 """
 
 from typing import List
@@ -27,13 +26,12 @@ TOP_10_ISSUE_TYPES: List[str] = [
 KFOLD_DEFAULTS = {
     'n_folds': 3,
     'random_seed': 42,
-    'max_entries_per_fold': 50,
     'workers': 1,
     'validate_all_types_per_fold': True,
     'top_n_only': True
 }
 
-# Balanced Batch Sampling Defaults
+# Balanced Batch Sampling for Pattern Learning
 SAMPLING_DEFAULTS = {
     'max_tp_per_batch': 3,
     'max_fp_per_batch': 3
@@ -43,23 +41,14 @@ SAMPLING_DEFAULTS = {
 LLM_DEFAULTS = {
     'max_tokens': 16000,
     'temperature': 0.0,
-    'platform': 'nim'
+    'platform': 'vertex'  # Options: 'local', 'nim', 'vertex'
 }
 
-# Phase 1.5 Evaluation Defaults
-PHASE_1_5_DEFAULTS = {
-    'max_eval_samples': 500
-}
-
-# Data Split Ratios (for stratified_data_splitter.py)
-SPLIT_RATIOS = {
-    'train': 0.6,
-    'validation': 0.2,
-    'test': 0.2
-}
-
-# Minimum Sample Requirements
-MIN_SAMPLES = {
-    'min_samples_per_type': 5,
-    'min_samples_per_fold': 1
+# Phase 2 Refinement Defaults
+REFINEMENT_DEFAULTS = {
+    'max_iterations': 10,
+    'convergence_threshold': 0.01,
+    'convergence_patience': 3,
+    'max_misclassified_per_iteration': 20,
+    'eval_sample_size': 500
 }
