@@ -121,6 +121,9 @@ class EvaluationMetrics:
                 'precision': 0.0,
                 'recall': 0.0,
                 'f1_score': 0.0,
+                'noise_reduction_score': 0,
+                'noise_reduction_rate': 0.0,
+                'max_possible_noise_reduction': 0,
                 'confusion_matrix': {
                     'TP_as_TP': 0,
                     'TP_as_FP': 0,
@@ -162,6 +165,20 @@ class EvaluationMetrics:
             else 0.0
         )
 
+        # Noise reduction score: 1 point for filtering FPs, 0 for keeping TPs, penalties for mistakes
+        # Perfect score = number of FPs (all FPs filtered, all TPs kept)
+        noise_reduction_score = self.fp_as_fp  # +1 for each FP correctly filtered
+        # TP_as_TP gets 0 points (expected behavior, no credit)
+        # Penalties:
+        # - FP_as_TP: False alarm sent to developer (missed opportunity to reduce noise)
+        # - TP_as_FP: Real bug filtered out (critical mistake)
+        max_possible_score = self.fp_as_fp + self.fp_as_tp  # Total FPs in dataset
+        noise_reduction_rate = (
+            noise_reduction_score / max_possible_score
+            if max_possible_score > 0
+            else 0.0
+        )
+
         confusion_matrix = {
             'TP_as_TP': self.tp_as_tp,
             'TP_as_FP': self.tp_as_fp,
@@ -199,6 +216,9 @@ class EvaluationMetrics:
             'precision': round(precision, 4),
             'recall': round(recall, 4),
             'f1_score': round(f1_score, 4),
+            'noise_reduction_score': noise_reduction_score,
+            'noise_reduction_rate': round(noise_reduction_rate, 4),
+            'max_possible_noise_reduction': max_possible_score,
             'confusion_matrix': confusion_matrix,
             'by_issue_type': by_issue_type,
             'pattern_citations': pattern_citations,
@@ -224,6 +244,12 @@ class EvaluationMetrics:
         print(f"  Precision:         {metrics['precision']:.2%}")
         print(f"  Recall:            {metrics['recall']:.2%}")
         print(f"  F1-Score:          {metrics['f1_score']:.2%}")
+
+        print(f"\nNoise Reduction (FP = 1 pt, TP = 0 pts):")
+        print(f"  Score:             {metrics['noise_reduction_score']}/{metrics['max_possible_noise_reduction']}")
+        print(f"  Rate:              {metrics['noise_reduction_rate']:.2%}")
+        print(f"  FPs Filtered:      {metrics['confusion_matrix']['FP_as_FP']}")
+        print(f"  FPs Missed:        {metrics['confusion_matrix']['FP_as_TP']}")
 
         print(f"\nConfusion Matrix (FP detection is positive class):")
         cm = metrics['confusion_matrix']

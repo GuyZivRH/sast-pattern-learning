@@ -56,7 +56,7 @@ class TestEvaluator:
         self.workers = workers
 
         # Create output directories
-        self.phase3_dir = self.output_dir / "phase3_test_results"
+        self.phase3_dir = self.output_dir / "phase3_test_results_baseline"
         self.phase3_dir.mkdir(parents=True, exist_ok=True)
 
         # Initialize components
@@ -238,23 +238,34 @@ class TestEvaluator:
             misclassified_examples.append(example)
 
         # Compile results
-        metrics = eval_result.get('metrics', {}).get('overall', {})
+        metrics = eval_result.get('metrics', {})
+
+        # Extract summary metrics for easy access
+        summary_metrics = {
+            'f1': metrics.get('f1_score', 0.0),
+            'precision': metrics.get('precision', 0.0),
+            'recall': metrics.get('recall', 0.0),
+            'accuracy': metrics.get('accuracy', 0.0)
+        }
 
         test_results = {
             'patterns': patterns,
-            'metrics': {
-                'f1': metrics.get('f1', 0.0),
-                'precision': metrics.get('precision', 0.0),
-                'recall': metrics.get('recall', 0.0),
-                'accuracy': metrics.get('accuracy', 0.0)
-            },
+            'metrics': summary_metrics,
+            'full_metrics': metrics,  # Include ALL metrics (noise reduction, by_issue_type, pattern citations, etc.)
             'test_set_stats': {
                 'total_entries': len(all_entries),
                 'fp_count': fp_count,
                 'tp_count': tp_count,
                 'test_files_count': len(test_files)
             },
-            'confusion_matrix': eval_result.get('metrics', {}).get('confusion_matrix', {}),
+            'confusion_matrix': metrics.get('confusion_matrix', {}),
+            'noise_reduction': {
+                'score': metrics.get('noise_reduction_score', 0),
+                'rate': metrics.get('noise_reduction_rate', 0.0),
+                'max_possible': metrics.get('max_possible_noise_reduction', 0)
+            },
+            'pattern_citations': metrics.get('pattern_citations', {}),
+            'phase2_verification': metrics.get('phase2_verification', {}),
             'misclassified_count': len(misclassified_results),
             'misclassified_examples': misclassified_examples,
             'full_evaluation': eval_result

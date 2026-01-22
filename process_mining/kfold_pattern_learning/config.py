@@ -16,7 +16,7 @@ TOP_10_ISSUE_TYPES: List[str] = [
     'INTEGER_OVERFLOW',
     'USE_AFTER_FREE',
     'CPPCHECK_WARNING',
-    'BUFFER_SIZE',
+    # 'BUFFER_SIZE',  # Excluded - too few samples (75 entries)
     'VARARGS',
     'COMPILER_WARNING',
     'COPY_PASTE_ERROR'
@@ -33,8 +33,10 @@ KFOLD_DEFAULTS = {
 
 # Balanced Batch Sampling for Pattern Learning
 SAMPLING_DEFAULTS = {
-    'max_tp_per_batch': 3,
-    'max_fp_per_batch': 3
+    'max_tp_per_batch': 5,
+    'max_fp_per_batch': 5,
+    'consolidate_patterns': True,      # Consolidate patterns after learning
+    'max_patterns_per_category': 20    # Target max patterns per category (FP/TP)
 }
 
 # LLM Configuration Defaults
@@ -50,5 +52,13 @@ REFINEMENT_DEFAULTS = {
     'convergence_threshold': 0.01,
     'convergence_patience': 3,
     'max_misclassified_per_iteration': 20,
-    'eval_sample_size': 500
+    'eval_sample_size': 750
+}
+
+# Issue types to exclude from Phase 2 refinement
+# Typically issue types with too few samples for reliable iterative refinement
+PHASE2_EXCLUDE_ISSUE_TYPES = {
+    'BUFFER_SIZE',  # Only 75 entries - too few for 750 sample size
+    'COMPILER_WARNING',
+    'COPY_PASTE_ERROR'
 }

@@ -116,13 +116,15 @@ class KFoldOrchestrator:
         self.top_n_list = top_n_list or TOP_10_ISSUE_TYPES
         self.max_misclassified_per_step = max_misclassified_per_step
 
-        # Create output directories
-        self.phase1_dir = self.output_dir / "phase1_kfold_results"
+        # Create run-specific timestamp (shared by output and log dirs)
+        from datetime import datetime as dt
+        run_timestamp = dt.now().strftime("%Y%m%d_%H%M%S")
+
+        # Create output directories with timestamp
+        self.phase1_dir = self.output_dir / f"run_{run_timestamp}"
         self.phase1_dir.mkdir(parents=True, exist_ok=True)
 
         # Create run-specific log directory under logs/
-        from datetime import datetime as dt
-        run_timestamp = dt.now().strftime("%Y%m%d_%H%M%S")
         self.run_log_dir = Path("logs") / f"run_logs_{run_timestamp}"
         self.run_log_dir.mkdir(parents=True, exist_ok=True)
 
@@ -301,11 +303,23 @@ class KFoldOrchestrator:
         end_time = datetime.now()
         duration = (end_time - start_time).total_seconds()
 
+        # Calculate average F1 across issue types
+        f1_scores = []
+        for issue_type, result in results_by_issue_type.items():
+            if 'error' not in result:
+                final_f1 = result.get('final_metrics', {}).get('f1_score', 0.0)
+                f1_scores.append(final_f1)
+
+        avg_f1 = sum(f1_scores) / len(f1_scores) if f1_scores else 0.0
+
         overall_summary = {
             'total_issue_types': len(self.issue_types),
             'total_folds': self.n_folds,
             'refinement_steps': self.n_folds,
-            'duration_seconds': duration
+            'duration_seconds': duration,
+            'avg_f1_across_issue_types': avg_f1,
+            'successful_issue_types': len(f1_scores),
+            'failed_issue_types': len(self.issue_types) - len(f1_scores)
         }
 
         # Compile final results
@@ -447,6 +461,7 @@ class KFoldOrchestrator:
                     refinements = self.pattern_refiner.refine_patterns(
                         current_patterns=current_patterns,
                         misclassified_entries=misclassified,
+                        evaluation_results=train_eval.get('results', []),
                         issue_type=issue_type
                     )
 
@@ -538,15 +553,34 @@ class KFoldOrchestrator:
         return steps
 
     def _extract_misclassified(self, eval_result: Dict, max_entries: int = 20) -> List:
-        """Extract misclassified entries from evaluation result."""
+        """Extract misclassified entries from evaluation result.
+
+        Returns:
+            List of ValidationEntry objects (reconstructed from eval results)
+        """
+        from process_mining.core.parsers import ValidationEntry
+
         misclassified = []
 
-        for result in eval_result.get('detailed_results', []):
+        for result in eval_result.get('results', []):
             predicted = result.get('predicted_classification', '')
             ground_truth = result.get('ground_truth_classification', '')
 
             if predicted != ground_truth:
-                misclassified.append(result.get('entry'))
+                # Reconstruct ValidationEntry from result dict
+                entry = ValidationEntry(
+                    entry_id=result.get('entry_id', ''),
+                    package_name=result.get('package_name', ''),
+                    issue_type=result.get('issue_type', ''),
+                    cwe=result.get('cwe', ''),
+                    file_path=result.get('file_path', ''),
+                    line_number=result.get('line_number', 0),
+                    ground_truth_classification=ground_truth,
+                    ground_truth_justification=result.get('ground_truth_justification', ''),
+                    error_trace=result.get('error_trace', ''),
+                    source_code=result.get('source_code', '')
+                )
+                misclassified.append(entry)
 
         # Limit to max_entries
         if len(misclassified) > max_entries:
@@ -560,11 +594,20 @@ class KFoldOrchestrator:
         """
         Apply refinements to current patterns.
 
-        Refinements structure:
+        Refinements structure (from LLM):
         {
-            "add": {"fp": [...], "tp": [...]},
-            "modify": {"fp": [...], "tp": [...]},
-            "remove": {"fp": [...], "tp": [...]}
+            "add": [
+                {"pattern_type": "fp"|"tp", "pattern_id": "...", "group": "...", "summary": "..."},
+                ...
+            ],
+            "modify": [
+                {"pattern_id": "...", "new_summary": "...", "justification": "..."},
+                ...
+            ],
+            "remove": [
+                {"pattern_id": "...", "justification": "..."},
+                ...
+            ]
         }
         """
         result_patterns = {
@@ -572,25 +615,33 @@ class KFoldOrchestrator:
             'tp': list(current_patterns.get('tp', []))
         }
 
-        # Apply additions
-        for pattern_type in ['fp', 'tp']:
-            new_patterns = refinements.get('add', {}).get(pattern_type, [])
-            result_patterns[pattern_type].extend(new_patterns)
+        # Apply additions (flat list with pattern_type field)
+        for new_pattern in refinements.get('add', []):
+            pattern_type = new_pattern.get('pattern_type', 'fp')
+            # Create pattern dict without pattern_type field (not needed in final patterns)
+            pattern_dict = {
+                'pattern_id': new_pattern.get('pattern_id'),
+                'group': new_pattern.get('group'),
+                'summary': new_pattern.get('summary')
+            }
+            result_patterns[pattern_type].append(pattern_dict)
 
-        # Apply modifications
-        for pattern_type in ['fp', 'tp']:
-            modifications = refinements.get('modify', {}).get(pattern_type, [])
-            for mod_pattern in modifications:
-                pattern_id = mod_pattern.get('pattern_id')
-                # Find and replace
+        # Apply modifications (flat list with pattern_id to identify target)
+        for modification in refinements.get('modify', []):
+            pattern_id = modification.get('pattern_id')
+            new_summary = modification.get('new_summary')
+
+            # Find and update in both fp and tp lists
+            for pattern_type in ['fp', 'tp']:
                 for idx, p in enumerate(result_patterns[pattern_type]):
                     if p.get('pattern_id') == pattern_id:
-                        result_patterns[pattern_type][idx] = mod_pattern
+                        # Update the summary, preserve other fields
+                        result_patterns[pattern_type][idx]['summary'] = new_summary
                         break
 
-        # Apply removals
+        # Apply removals (flat list with pattern_id to identify targets)
+        remove_ids = [p.get('pattern_id') for p in refinements.get('remove', [])]
         for pattern_type in ['fp', 'tp']:
-            remove_ids = [p.get('pattern_id') for p in refinements.get('remove', {}).get(pattern_type, [])]
             result_patterns[pattern_type] = [
                 p for p in result_patterns[pattern_type]
                 if p.get('pattern_id') not in remove_ids

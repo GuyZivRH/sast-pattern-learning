@@ -37,7 +37,8 @@ class FoldEvaluator:
         self,
         platform: str = "nim",
         workers: int = 1,
-        verbose: bool = False
+        verbose: bool = False,
+        base_sampling_seed: int = 42
     ):
         """
         Initialize fold evaluator.
@@ -46,10 +47,13 @@ class FoldEvaluator:
             platform: LLM platform ("local" or "nim")
             workers: Number of parallel workers for evaluation
             verbose: Enable verbose logging
+            base_sampling_seed: Base random seed for stratified sampling (default: 42)
+                               Actual seed = base_seed + iteration_num for different samples per iteration
         """
         self.platform = platform
         self.workers = workers
         self.verbose = verbose
+        self.base_sampling_seed = base_sampling_seed
 
         if verbose:
             logging.getLogger().setLevel(logging.DEBUG)
@@ -59,7 +63,8 @@ class FoldEvaluator:
         patterns_dict: Dict,
         val_files: List[Path],
         issue_type: str,
-        max_entries: int = None
+        max_entries: int = None,
+        iteration_num: int = 0
     ) -> Dict:
         """
         Evaluate patterns on validation files.
@@ -70,6 +75,8 @@ class FoldEvaluator:
             issue_type: Issue type these patterns are for
             max_entries: Optional max entries to sample (stratified by FP/TP)
                         If None, evaluates all entries
+            iteration_num: Iteration number (used for seeding: base_seed + iteration_num)
+                          Ensures different samples per iteration but reproducible across runs
 
         Returns:
             Dictionary with metrics:
@@ -105,8 +112,9 @@ class FoldEvaluator:
 
         # Apply stratified sampling if max_entries specified
         if max_entries and len(all_entries) > max_entries:
-            sampled_entries = self._stratified_sample(all_entries, max_entries)
-            logger.info(f"  Sampled {len(sampled_entries)} / {len(all_entries)} entries (stratified by FP/TP)")
+            sampling_seed = self.base_sampling_seed + iteration_num
+            sampled_entries = self._stratified_sample(all_entries, max_entries, sampling_seed)
+            logger.info(f"  Sampled {len(sampled_entries)} / {len(all_entries)} entries (stratified by FP/TP, seed={sampling_seed})")
         else:
             sampled_entries = all_entries
 
@@ -168,13 +176,14 @@ class FoldEvaluator:
 
             return fold_results
 
-    def _stratified_sample(self, all_entries: List, max_entries: int) -> List:
+    def _stratified_sample(self, all_entries: List, max_entries: int, seed: int) -> List:
         """
         Stratified sampling preserving FP/TP ratio.
 
         Args:
             all_entries: List of ValidationEntry objects
             max_entries: Maximum entries to sample
+            seed: Random seed for reproducible sampling
 
         Returns:
             Sampled list of ValidationEntry objects preserving FP/TP ratio
@@ -183,6 +192,9 @@ class FoldEvaluator:
 
         if not all_entries or len(all_entries) <= max_entries:
             return all_entries
+
+        # Set seed for reproducibility
+        random.seed(seed)
 
         # Separate into FP and TP
         fp_entries = [e for e in all_entries if 'FALSE' in e.ground_truth_classification]
@@ -213,7 +225,7 @@ class FoldEvaluator:
         logger.debug(f"    Stratified sampling: {len(sampled)} / {total_count} entries "
                     f"(FP: {len(sampled_fp)}/{len(fp_entries)}, "
                     f"TP: {len(sampled_tp)}/{len(tp_entries)}, "
-                    f"FP ratio: {fp_ratio:.2f})")
+                    f"FP ratio: {fp_ratio:.2f}, seed: {seed})")
 
         return sampled
 

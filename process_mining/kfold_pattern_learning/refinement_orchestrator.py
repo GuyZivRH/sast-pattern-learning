@@ -28,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 
 from process_mining.kfold_pattern_learning.pattern_refiner import PatternRefiner
 from process_mining.kfold_pattern_learning.fold_evaluator import FoldEvaluator
+from process_mining.kfold_pattern_learning.config import REFINEMENT_DEFAULTS
 from process_mining.core.parsers import ValidationEntryParser
 
 logging.basicConfig(
@@ -54,11 +55,11 @@ class RefinementOrchestrator:
         output_dir: Path,
         platform: str = "nim",
         workers: int = 1,
-        max_iterations: int = 10,
-        convergence_threshold: float = 0.01,
-        convergence_patience: int = 3,
-        max_misclassified_per_iteration: int = 20,
-        eval_sample_size: int = 500
+        max_iterations: int = None,
+        convergence_threshold: float = None,
+        convergence_patience: int = None,
+        max_misclassified_per_iteration: int = None,
+        eval_sample_size: int = None
     ):
         """
         Initialize refinement orchestrator.
@@ -81,11 +82,13 @@ class RefinementOrchestrator:
         self.output_dir = Path(output_dir)
         self.platform = platform
         self.workers = workers
-        self.max_iterations = max_iterations
-        self.convergence_threshold = convergence_threshold
-        self.convergence_patience = convergence_patience
-        self.max_misclassified_per_iteration = max_misclassified_per_iteration
-        self.eval_sample_size = eval_sample_size if eval_sample_size and eval_sample_size > 0 else None
+
+        # Use config defaults if not specified
+        self.max_iterations = max_iterations if max_iterations is not None else REFINEMENT_DEFAULTS['max_iterations']
+        self.convergence_threshold = convergence_threshold if convergence_threshold is not None else REFINEMENT_DEFAULTS['convergence_threshold']
+        self.convergence_patience = convergence_patience if convergence_patience is not None else REFINEMENT_DEFAULTS['convergence_patience']
+        self.max_misclassified_per_iteration = max_misclassified_per_iteration if max_misclassified_per_iteration is not None else REFINEMENT_DEFAULTS['max_misclassified_per_iteration']
+        self.eval_sample_size = eval_sample_size if eval_sample_size is not None and eval_sample_size > 0 else REFINEMENT_DEFAULTS['eval_sample_size']
 
         # Create output directories
         self.phase2_dir = self.output_dir / "phase2_refinement_results"
@@ -268,11 +271,12 @@ class RefinementOrchestrator:
                 patterns_dict=current_patterns,
                 val_files=train_files,
                 issue_type=issue_type,
-                max_entries=self.eval_sample_size
+                max_entries=self.eval_sample_size,
+                iteration_num=iteration
             )
 
-            train_metrics = train_eval_result.get('metrics', {}).get('overall', {})
-            train_f1 = train_metrics.get('f1', 0.0)
+            train_metrics = train_eval_result.get('metrics', {})
+            train_f1 = train_metrics.get('f1_score', 0.0)
 
             logger.info(f"    Train F1: {train_f1:.3f}")
             logger.info(f"    Train Precision: {train_metrics.get('precision', 0.0):.3f}")
@@ -284,11 +288,12 @@ class RefinementOrchestrator:
                 patterns_dict=current_patterns,
                 val_files=val_files,
                 issue_type=issue_type,
-                max_entries=self.eval_sample_size
+                max_entries=self.eval_sample_size,
+                iteration_num=iteration
             )
 
-            val_metrics = val_eval_result.get('metrics', {}).get('overall', {})
-            val_f1 = val_metrics.get('f1', 0.0)
+            val_metrics = val_eval_result.get('metrics', {})
+            val_f1 = val_metrics.get('f1_score', 0.0)
 
             logger.info(f"    Val F1: {val_f1:.3f}")
             logger.info(f"    Val Precision: {val_metrics.get('precision', 0.0):.3f}")
@@ -350,12 +355,25 @@ class RefinementOrchestrator:
                 convergence_reason = f"No VAL F1 improvement for {self.convergence_patience} iterations"
                 break
 
-            if len(train_misclassified_entries) == 0:
-                logger.info(f"\n  Perfect classification on TRAIN achieved!")
+            # Check for perfect train F1 (more reliable than counting sampled misclassifications)
+            if train_f1 >= 0.999:  # Allow tiny rounding tolerance
+                logger.info(f"\n  Perfect classification on TRAIN achieved (F1={train_f1:.3f})!")
                 convergence_reason = "Perfect TRAIN classification"
                 break
 
+            # Also check if no misclassified entries in sample (but only if F1 is also high)
+            if len(train_misclassified_entries) == 0 and train_f1 >= 0.95:
+                logger.info(f"\n  No misclassified entries in TRAIN sample (F1={train_f1:.3f})")
+                convergence_reason = "No TRAIN misclassifications in sample"
+                break
+
             # Step E: Refine patterns based on TRAIN misclassifications
+            if len(train_misclassified_entries) == 0:
+                logger.warning(f"  ⚠️  No misclassified entries found in TRAIN sample, but F1={train_f1:.3f} (not perfect)")
+                logger.warning(f"  ⚠️  This suggests sampling missed the errors. Stopping refinement.")
+                convergence_reason = f"No misclassifications in sample (F1={train_f1:.3f})"
+                break
+
             logger.info(f"  Refining patterns based on {len(train_misclassified_entries)} TRAIN misclassified examples...")
             refinements = self.pattern_refiner.refine_patterns(
                 current_patterns=current_patterns,
@@ -409,28 +427,42 @@ class RefinementOrchestrator:
         combined_files: List[Path],
         issue_type: str
     ) -> List:
-        """Get misclassified ValidationEntry objects from evaluation results."""
-        parser = ValidationEntryParser()
+        """
+        Get misclassified ValidationEntry objects from evaluation results.
 
-        # Parse all entries
-        all_entries = []
-        for file in combined_files:
-            entries = parser.parse_file(file)
-            entries = [e for e in entries if e.issue_type == issue_type]
-            all_entries.extend(entries)
+        Note: We reconstruct entries from the evaluation results rather than re-parsing
+        all files, since eval_result contains only the sampled subset that was evaluated.
+        """
+        from process_mining.core.data_models import ValidationEntry
 
-        # Get misclassified results
+        # Get misclassified results from the evaluation
         results = eval_result.get('results', [])
         misclassified_results = [r for r in results if not r.get('correct', True)]
 
-        # Match misclassified results to entries using entry_id
+        logger.debug(f"    Total evaluation results: {len(results)}")
+        logger.debug(f"    Misclassified results: {len(misclassified_results)}")
+
+        # Reconstruct ValidationEntry objects from misclassified results
+        # The evaluation results contain all the necessary fields
         misclassified_entries = []
         for result in misclassified_results:
-            result_entry_id = result.get('entry_id', '')
-            for entry in all_entries:
-                if entry.entry_id == result_entry_id:
-                    misclassified_entries.append(entry)
-                    break
+            try:
+                entry = ValidationEntry(
+                    entry_id=result.get('entry_id', ''),
+                    package_name=result.get('package_name', ''),
+                    issue_type=result.get('issue_type', ''),
+                    cwe=result.get('cwe', ''),
+                    error_trace=result.get('error_trace', ''),
+                    source_code=result.get('source_code', ''),
+                    file_path=result.get('file_path', ''),
+                    line_number=result.get('line_number', 0),
+                    ground_truth_classification=result.get('ground_truth_classification', ''),
+                    ground_truth_justification=result.get('ground_truth_justification', '')
+                )
+                misclassified_entries.append(entry)
+            except Exception as e:
+                logger.warning(f"    Failed to reconstruct entry from result: {e}")
+                continue
 
         return misclassified_entries
 

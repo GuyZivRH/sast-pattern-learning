@@ -104,7 +104,9 @@ class PatternLearner:
         train_files: List[Path],
         issue_type: str,
         max_tp_per_batch: int = SAMPLING_DEFAULTS['max_tp_per_batch'],
-        max_fp_per_batch: int = SAMPLING_DEFAULTS['max_fp_per_batch']
+        max_fp_per_batch: int = SAMPLING_DEFAULTS['max_fp_per_batch'],
+        consolidate: bool = SAMPLING_DEFAULTS['consolidate_patterns'],
+        max_patterns_per_category: int = SAMPLING_DEFAULTS['max_patterns_per_category']
     ) -> Dict:
         """
         Learn patterns from training files for a specific issue type.
@@ -116,6 +118,8 @@ class PatternLearner:
             issue_type: Issue type to learn patterns for (e.g., "RESOURCE_LEAK")
             max_tp_per_batch: Max TP entries to send to LLM (default: 3)
             max_fp_per_batch: Max FP entries to send to LLM (default: 3)
+            consolidate: Whether to consolidate patterns after learning (default: True)
+            max_patterns_per_category: Target max patterns per category (default: 20)
 
         Returns:
             Dictionary with {"fp": [...], "tp": [...]} pattern structure
@@ -265,6 +269,25 @@ class PatternLearner:
         logger.info(f"  Generated {len(patterns.get('fp', []))} FP patterns, "
                    f"{len(patterns.get('tp', []))} TP patterns")
 
+        # Consolidate patterns if enabled and count exceeds threshold
+        if consolidate:
+            fp_count = len(patterns.get('fp', []))
+            tp_count = len(patterns.get('tp', []))
+
+            if fp_count > max_patterns_per_category or tp_count > max_patterns_per_category:
+                logger.info(f"  Consolidating patterns (FP: {fp_count}, TP: {tp_count} → target: {max_patterns_per_category})...")
+                print(f"DEBUG [{issue_type}]: Consolidating {fp_count} FP + {tp_count} TP patterns...", flush=True)
+
+                patterns = self.consolidate_patterns(
+                    raw_patterns=patterns,
+                    issue_type=issue_type,
+                    max_patterns_per_category=max_patterns_per_category
+                )
+
+                logger.info(f"  After consolidation: {len(patterns.get('fp', []))} FP, "
+                           f"{len(patterns.get('tp', []))} TP patterns")
+                print(f"DEBUG [{issue_type}]: Consolidation complete - {len(patterns.get('fp', []))} FP, {len(patterns.get('tp', []))} TP", flush=True)
+
         return patterns
 
     def _sample_with_replacement(
@@ -381,6 +404,128 @@ Human Expert Justification: {entry.ground_truth_justification}"""
                     deduplicated[category].append(pattern)
 
         return deduplicated
+
+    def consolidate_patterns(
+        self,
+        raw_patterns: Dict,
+        issue_type: str,
+        max_patterns_per_category: int = 20
+    ) -> Dict:
+        """
+        Consolidate similar patterns using LLM to merge redundant ones.
+
+        Args:
+            raw_patterns: Raw patterns from learn_patterns() with potential duplicates
+            issue_type: Issue type being processed
+            max_patterns_per_category: Target max patterns per category
+
+        Returns:
+            Consolidated patterns dictionary
+        """
+        consolidated = {"fp": [], "tp": []}
+
+        for category in ["fp", "tp"]:
+            patterns = raw_patterns.get(category, [])
+
+            if len(patterns) <= max_patterns_per_category:
+                # Already within limit, no consolidation needed
+                consolidated[category] = patterns
+                logger.info(f"    {category.upper()}: {len(patterns)} patterns (within limit, no consolidation needed)")
+                continue
+
+            logger.info(f"    Consolidating {len(patterns)} {category.upper()} patterns → target: {max_patterns_per_category}")
+
+            # Build consolidation prompt
+            prompt = self._build_consolidation_prompt(patterns, issue_type, category, max_patterns_per_category)
+
+            # Call LLM to consolidate
+            try:
+                self.classifier._wait_for_rate_limit()
+
+                if self.classifier.platform == "vertex":
+                    response = self.classifier.client.messages.create(
+                        model=self.model,
+                        max_tokens=self.max_tokens,
+                        temperature=0.0,  # Deterministic for consolidation
+                        messages=[{"role": "user", "content": prompt}]
+                    )
+                    response_text = response.content[0].text
+                else:
+                    response = self.classifier.client.chat.completions.create(
+                        model=self.model,
+                        max_tokens=self.max_tokens,
+                        temperature=0.0,
+                        messages=[{"role": "user", "content": prompt}]
+                    )
+                    response_text = response.choices[0].message.content
+
+                # Parse consolidated patterns
+                consolidated_patterns = self._parse_pattern_response(response_text, issue_type)
+                consolidated[category] = consolidated_patterns.get(category, [])
+
+                logger.info(f"    Consolidated {len(patterns)} → {len(consolidated[category])} {category.upper()} patterns")
+
+            except Exception as e:
+                logger.error(f"    Consolidation failed: {e}, keeping original patterns (truncated)")
+                consolidated[category] = patterns[:max_patterns_per_category]  # Fallback: truncate
+
+        return consolidated
+
+    def _build_consolidation_prompt(
+        self,
+        patterns: List[Dict],
+        issue_type: str,
+        category: str,
+        target_count: int
+    ) -> str:
+        """Build prompt for pattern consolidation."""
+        category_name = "FALSE POSITIVE" if category == "fp" else "TRUE POSITIVE"
+
+        # Format patterns as numbered list
+        patterns_text = []
+        for idx, pattern in enumerate(patterns, 1):
+            patterns_text.append(f"{idx}. [{pattern.get('group', 'N/A')}] {pattern.get('summary', '')}")
+
+        prompt = f"""You are a pattern consolidation expert. You have {len(patterns)} {category_name} patterns for {issue_type} SAST findings that need to be merged to reduce redundancy.
+
+## Current Patterns ({len(patterns)} total):
+
+{chr(10).join(patterns_text)}
+
+## Task:
+
+Consolidate these patterns by merging similar/overlapping ones into **{target_count} general patterns**.
+
+**Consolidation Guidelines:**
+1. Merge patterns that describe the same root cause with similar indicators
+2. Keep distinct patterns that describe genuinely different scenarios
+3. Generalize specific details while preserving key distinguishing features
+4. Ensure each consolidated pattern covers all cases from merged patterns
+5. Update group labels to reflect consolidated categories
+
+**Output Format:**
+
+Return ONLY a JSON object with this structure:
+```json
+{{
+  "{category}": [
+    {{
+      "pattern_id": "{issue_type}-{category.upper()}-001",
+      "group": "Consolidated group name",
+      "summary": "Merged summary covering all consolidated cases..."
+    }},
+    ...
+  ]
+}}
+```
+
+**IMPORTANT:**
+- Output ONLY the JSON, no additional text
+- Aim for exactly {target_count} patterns (±2 is acceptable)
+- Each summary should be comprehensive but concise (2-4 sentences)
+"""
+
+        return prompt
 
     def _parse_pattern_response(
         self,
